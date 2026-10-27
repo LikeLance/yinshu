@@ -130,7 +130,7 @@ def eval_e2e() -> dict:
         sid, last, viol, err = None, None, 0, ""
         try:
             for msg in msgs:
-                d = json.loads(M.chat(M.ChatReq(session_id=sid, text=msg)).body)
+                d = json.loads(M.handle_chat(M.ChatReq(session_id=sid, text=msg)).body)
                 sid = d["session_id"]
                 last = d
                 viol += len(d["debug"].get("guard_violations") or [])
@@ -201,6 +201,16 @@ def write_report(i: dict, inj: dict, pol: dict, e2e: dict | None) -> None:
 
 
 def main() -> int:
+    # 评测结果必须可复现：权限引擎有「凌晨 0-6 点操作 +10 分」这一项，
+    # 不钉住时间的话，同一份代码在 00:47 跑出来的端到端成功率会比 14:00 低一截
+    # （小额转账从 AUTO 掉到 CONFIRM、挂失从 CONFIRM 掉到 HANDOFF）。
+    from datetime import datetime
+
+    from backend.core import clock
+
+    clock.freeze(datetime.now().replace(hour=14, minute=0, second=0, microsecond=0))
+    print("[eval] 时钟固定为 14:00（可复现）")
+
     offline = "--offline" in sys.argv
     print("[eval] 意图识别...")
     i = eval_intent()

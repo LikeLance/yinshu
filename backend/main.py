@@ -641,20 +641,39 @@ def _executed(resp: JSONResponse) -> bool:
         return False
 
 
-@api.post("/chat")
-def chat(request: Request, req: ChatReq):
-    t0 = time.time()
-    p = identity.principal_from_headers(request.headers, _client_ip(request))
-    trace = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+def handle_chat(req: ChatReq, headers: dict[str, str] | None = None,
+                ip: str = "127.0.0.1") -> JSONResponse:
+    """对话主入口（不依赖 FastAPI Request）。
 
-    # 幂等键只由"业务请求"决定，与本次网络会话无关：
-    # 客户端可用 X-Idempotency-Key 显式指定；不给则按 (uid, device, 请求体) 派生。
+    抽出来的原因有两个：
+    1. 进程内调用者（评测脚本、其他渠道 adapter）不必伪造一个 Request；
+    2. "加渠道只写 adapter"这句话得有地方落——adapter 调这个函数即可。
+    """
+    t0 = time.time()
+    hdrs = {k.lower(): v for k, v in (headers or {}).items()}
+    p = identity.principal_from_headers(hdrs, ip)
+    trace = hdrs.get("x-request-id") or uuid.uuid4().hex[:16]
+
+    # 先按**原始请求体**算指纹——客户端没带 session_id 时，如果拿补全后的体去哈希，
+    # 每次都会生成新会话、新哈希，重试就永远对不上（等于没有幂等）。
     body = json.dumps(req.model_dump(exclude={"device_trusted"}), ensure_ascii=False,
                       sort_keys=True, default=str).encode()
     req_hash = hashlib.sha256(body).hexdigest()
-    explicit = (request.headers.get("x-idempotency-key") or "").strip()
-    key = explicit or idem.derive_key(p.uid, p.device_id, body)
-    ttl = config.IDEMPOTENCY_TTL if explicit else config.IDEMPOTENCY_AUTO_TTL
+
+    # 再取会话，拿到"这次请求作用在哪个待确认事务上"。
+    # 只用请求体派生幂等键是不够的：两笔不同业务的「确认」请求体完全一样
+    # （都是 {session_id, "确认"}），会被缓存串成同一笔——端到端剧本里
+    # 就出现过"确认 8000 元"却执行了上一场的定时转账。
+    s0 = fsm.get(req.session_id, p)
+    req = req.model_copy(update={"session_id": s0.sid})
+    scope = str(s0.stash.get("confirm_id") or s0.state or "IDLE")
+
+    explicit = (hdrs.get("x-idempotency-key") or "").strip()
+    if explicit:
+        key, ttl = explicit, config.IDEMPOTENCY_TTL
+    else:
+        key = idem.derive_key(p.uid, p.device_id, body + b"|" + scope.encode())
+        ttl = config.IDEMPOTENCY_AUTO_TTL
 
     slot = idem.begin(p.uid, "chat", key, req_hash, ttl=ttl)
     if slot.state == "replay":
@@ -671,7 +690,7 @@ def chat(request: Request, req: ChatReq):
 
     token = reqctx.begin(p, trace, key)
     try:
-        resp = _chat_inner(request, req, p, trace, t0)
+        resp = _chat_inner(req, p, trace, t0)
         done = _executed(resp)
         try:
             if done:
@@ -693,8 +712,12 @@ def chat(request: Request, req: ChatReq):
         reqctx.reset(token)
 
 
-def _chat_inner(request: Request, req: ChatReq, p: identity.Principal, trace: str,
-                t0: float):
+@api.post("/chat")
+def chat(request: Request, req: ChatReq):
+    return handle_chat(req, dict(request.headers), _client_ip(request))
+
+
+def _chat_inner(req: ChatReq, p: identity.Principal, trace: str, t0: float):
     s = fsm.get(req.session_id, p)
     # 设备信任由服务端按 (uid, device_id) 历史判定，不再采信客户端自述
     s.device_trusted = identity.device_trusted(p.uid, p.device_id)
