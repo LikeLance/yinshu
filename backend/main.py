@@ -30,7 +30,7 @@ from backend.core.logging import get
 from backend.core.middleware import ApiKeyGate, BodyLimit, RateLimit, RequestContext
 from backend.nlu import intent as nlu
 from backend.nlu.slots import parse_amount, parse_people, parse_payee, parse_when
-from backend.planner import executor, planner
+from backend.planner import executor, fingerprint, planner
 from backend.planner.contracts import Plan, Step
 from backend.presenter import build as build_presentation, plan_card
 from backend.security import audit, guard, identity, injection, policy
@@ -237,6 +237,104 @@ def _notice(tone: str, title: str, lines: list[str], **extra) -> dict:
     return {"type": "notice", "tone": tone, "title": title, "lines": lines, **extra}
 
 
+# ---------------- 确认阶段：指纹 / 快照 / 漂移 ----------------
+
+def _first_of(results: dict, key: str) -> Any:
+    """在任意步骤结果里找第一个出现的字段，避免把 's1'/'s2' 这类约定写死。"""
+    for r in results.values():
+        if isinstance(r, dict) and r.get(key) is not None:
+            return r[key]
+    return None
+
+
+def _snapshot(slots: dict, out: executor.Outcome, ctx: policy.Context,
+              d: policy.Decision) -> dict:
+    """只记"可比较的标量"，不把整份 Outcome 落盘。
+
+    整份落盘有两个问题：体积大；更重要是"确认时读到的是旧对象"，等于把
+    TOCTOU 漏洞换个地方藏起来。
+    """
+    payee = _first_of(out.results, "payee") or {}
+    return {
+        "payee_id": payee.get("id"),
+        "payee_name": payee.get("name"),
+        "blacklisted": bool(payee.get("blacklisted")),
+        "balance": _first_of(out.results, "balance"),
+        "amount": str(ctx.amount),
+        "velocity_1h": ctx.velocity_1h,
+        "daily_count": ctx.daily_count,
+        "segment": ctx.segment,
+        "risk": d.risk,
+        "tier": d.tier,
+    }
+
+
+def _drift(old: dict, new: dict, fp_old: str | None, fp_new: str,
+           d_old: policy.Decision, d_new: policy.Decision) -> dict:
+    """比对预览时与确认时的世界状态，分级处置。
+
+    HARD = 用户看到的对象/金额变了，或风险升级 → 必须重新确认；
+    SOFT = 只有频率类特征波动 → 照常执行，但留痕并提示。
+    不做"任何变化都拒绝"：余额从 9000 涨到 9500 不该打断用户。
+    """
+    hard: list[str] = []
+    soft: list[str] = []
+
+    if fp_old and fp_new and fp_old != fp_new:
+        hard.append("执行参数已变化（金额/收款人/时间等）")
+    if old.get("payee_id") != new.get("payee_id"):
+        hard.append(f"收款人变了：{old.get('payee_name')} → {new.get('payee_name')}")
+    if not old.get("blacklisted") and new.get("blacklisted"):
+        hard.append("收款人已被列入反诈黑名单")
+    if d_new.tier in ("DENY", "HANDOFF") and d_old.tier != d_new.tier:
+        hard.append(f"权限等级变化：{d_old.tier} → {d_new.tier}")
+    if d_new.risk - d_old.risk >= 15:
+        hard.append(f"风险分上升：{d_old.risk} → {d_new.risk}")
+
+    try:
+        bal, amt = Decimal(str(new["balance"])), Decimal(str(new["amount"]))
+        if amt > 0 and bal < amt:
+            hard.append(f"可用余额不足：{bal:.2f} 元 < 待执行 {amt:.2f} 元")
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    for key, label in (("velocity_1h", "1 小时内资金操作次数"),
+                       ("daily_count", "当日累计操作次数"),
+                       ("segment", "客户分层")):
+        if old.get(key) != new.get(key):
+            soft.append(f"{label}：{old.get(key)} → {new.get(key)}")
+    if not hard and old.get("balance") != new.get("balance"):
+        soft.append(f"可用余额：{old.get('balance')} → {new.get('balance')}")
+
+    return {"hard": bool(hard), "changes": hard, "soft": soft}
+
+
+def _stash_pending(s: fsm.Session, plan: Plan, out: executor.Outcome, ctx: policy.Context,
+                   d: policy.Decision, slots: dict, intent: str, inj: bool) -> None:
+    """把"待确认事务"连同指纹、快照、版本号一起落盘。"""
+    fsm.await_confirm(s, {
+        "v": 2,
+        "fp": fingerprint.of(plan, slots, out.results),
+        "ver": s.ver,
+        "confirm_id": uuid.uuid4().hex,
+        "plan": plan, "out": out, "decision": d, "slots": slots,
+        "intent": intent, "inj": inj,
+        "snapshot": _snapshot(slots, out, ctx, d),
+        "double": d.require_double_confirm, "confirm_n": 0,
+    })
+
+
+def _confirm_card(plan: Plan, slots: dict, out: executor.Outcome, d: policy.Decision,
+                  extra_rows: list[list[str]] | None = None,
+                  note: str = "点确认后才会真正执行；说「取消」随时终止") -> dict:
+    rows = _confirm_rows(plan, slots, out)
+    if extra_rows:
+        rows = extra_rows + rows
+    return {"type": "confirm", "title": "请确认这笔操作", "rows": rows,
+            "reasons": d.reasons, "risk": d.risk, "tier": d.tier,
+            "need_double": d.require_double_confirm, "note": note}
+
+
 # ---------------- 主处理 ----------------
 
 def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
@@ -325,7 +423,12 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
                     "debug": {"intent": intent, "error": e.code}}
         text_out, card, extra = build_presentation(intent, plan, out, None, slots)
         if card and card.get("type") == "choose":
-            fsm.ask(s, "CHOOSE", {"intent": intent, "slots": slots, "kind": card.get("kind"),
+            # 生日流程是「先锁预算 → 选礼物 → 下单」：把 hold_id 带进下一阶段，
+            # 下单失败时才有东西可补偿（否则锁住的预算永远挂在 holds 表里）。
+            hid = _first_of(out.results, "hold_id")
+            stash_slots = {**slots, **({"hold_id": hid} if hid else {})}
+            fsm.ask(s, "CHOOSE", {"intent": intent, "slots": stash_slots,
+                                  "kind": card.get("kind"),
                                   "options": (out.results.get("s2") or {}).get("gifts") or []})
         all_facts = executor.facts(slots, out.results, extra)
         bad = guard.check(text_out, all_facts)
@@ -353,15 +456,9 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
                 "debug": {"intent": intent, "decision": d.to_dict()}}
 
     if d.tier == "CONFIRM":
-        fsm.await_confirm(s, {"plan": plan, "out": out, "decision": d, "slots": slots,
-                              "intent": intent, "double": d.require_double_confirm, "confirm_n": 0})
-        card = {"type": "confirm", "title": "请确认这笔操作",
-                "rows": _confirm_rows(plan, slots, out),
-                "reasons": d.reasons, "risk": d.risk, "tier": d.tier,
-                "need_double": d.require_double_confirm,
-                "note": "点确认后才会真正执行；说「取消」随时终止"}
+        _stash_pending(s, plan, out, ctx, d, slots, intent, inj)
         return {"reply": f"这笔需要您确认一下（风险分 {d.risk}）。{('这是不可逆操作，确认后无法撤销。' if d.require_double_confirm else '')}",
-                "card": card,
+                "card": _confirm_card(plan, slots, out, d),
                 "debug": {"intent": intent, "decision": d.to_dict(),
                           "plan": [st.model_dump() for st in plan.steps]}}
 
@@ -567,7 +664,7 @@ def _chat_inner(request: Request, req: ChatReq, p: identity.Principal, trace: st
                     s, trace, "这是不可逆操作。确认无误请再回复一次「确认」。",
                     _notice("warn", "需要二次确认", ["挂失后原卡立即失效，不可撤销"]),
                     {"double_confirm": 1}, t0))
-            return JSONResponse(_execute_pending(s, trace, t0))
+            return JSONResponse(_execute_pending(s, trace, t0, p))
         fsm.reset(s)   # 其他输入：先撤销待确认事务，再按新指令处理
 
     # ---------- 选择态 ----------
@@ -589,7 +686,7 @@ def _chat_inner(request: Request, req: ChatReq, p: identity.Principal, trace: st
                         steps=[Step(id="s1", tool="gift.order",
                                     args={"gift_id": opt["gift_id"],
                                           "deliver_at": (slots.get("when") or {}).get("date") or ""},
-                                    label=f"下单「{opt.get('name')}」")])
+                                    label=f"下单「{opt.get('name')}」", on_fail="compensate")])
             res = _run_plan(s, plan, "gift.order", plan.slots, trace, scan.level != "clean")
             return JSONResponse({**_resp(s, trace, res["reply"], res["card"], res.get("debug", {}), t0)})
         forced = int(opt["id"]) if kind == "payee" else None
@@ -654,12 +751,9 @@ def _run_plan(s: fsm.Session, plan: Plan, intent: str, slots: dict, trace: str, 
                                 "已拒绝执行" if d.tier == "DENY" else "需人工复核", d.reasons),
                 "debug": {"decision": d.to_dict()}}
     if d.tier == "CONFIRM":
-        fsm.await_confirm(s, {"plan": plan, "out": out, "decision": d, "slots": slots,
-                              "intent": intent, "double": d.require_double_confirm, "confirm_n": 0})
+        _stash_pending(s, plan, out, ctx, d, slots, intent, inj)
         return {"reply": f"这笔需要您确认（风险分 {d.risk}）。",
-                "card": {"type": "confirm", "title": "请确认这笔操作",
-                         "rows": _confirm_rows(plan, slots, out), "reasons": d.reasons,
-                         "risk": d.risk, "tier": d.tier, "need_double": False},
+                "card": _confirm_card(plan, slots, out, d, note="点确认后才会真正执行"),
                 "debug": {"decision": d.to_dict()}}
     try:
         executor.run(plan, "commit", trace, out)
@@ -676,31 +770,88 @@ def _run_plan(s: fsm.Session, plan: Plan, intent: str, slots: dict, trace: str, 
     return {"reply": text_out, "card": card, "debug": {"decision": d.to_dict(), "guard_violations": bad}}
 
 
-def _execute_pending(s: fsm.Session, trace: str, t0: float) -> dict:
+def _execute_pending(s: fsm.Session, trace: str, t0: float, p: Any = None) -> dict:
+    """确认后执行。
+
+    **不信任**落盘的预览快照：先重新预览，再重新决策，然后比对漂移。
+    原实现直接拿最多 5 分钟前的 out 去 commit，期间余额变化、收款人被拉黑、
+    频率特征上升都不会被重新评估——"权限下沉到执行层"在确认这一跳失守。
+    """
     stash = s.stash
     plan: Plan = stash["plan"]
-    out: executor.Outcome = stash["out"]
-    d: policy.Decision = stash["decision"]
-    intent, slots = stash["intent"], stash["slots"]
+    slots: dict = stash["slots"]
+    intent: str = stash["intent"]
+    inj = bool(stash.get("inj"))
+    d_old: policy.Decision = stash.get("decision") or policy.decide(
+        _context(plan, slots, stash.get("out") or executor.Outcome(), _stats(), inj, s))
+    confirm_id = str(stash.get("confirm_id") or uuid.uuid4().hex)
+
+    # 1) 重新预览：只读步骤重跑，确认"世界还是那个世界"
+    fresh = executor.Outcome()
     try:
-        executor.run(plan, "commit", trace, out)
+        executor.run(plan, "preview", trace, fresh, principal=p)
+    except YinshuError as e:
+        audit.append(trace, "recheck_failed", {"code": e.code}, "error")
+        fsm.reset(s)
+        msg = e.user_msg or "执行前复核没通过，请重新发起。"
+        return _resp(s, trace, msg, _notice("danger", "已终止", [msg]),
+                     {"error": e.code, "rechecked": True}, t0)
+
+    # 2) 重算指纹 + 重新决策 + 比对漂移
+    fp2 = fingerprint.of(plan, slots, fresh.results)
+    ctx2 = _context(plan, slots, fresh, _stats(), inj, s)
+    d2 = policy.decide(ctx2)
+    snap2 = _snapshot(slots, fresh, ctx2, d2)
+    drift = _drift(stash.get("snapshot") or {}, snap2, stash.get("fp"), fp2, d_old, d2)
+    audit.append(trace, "confirm_recheck",
+                 {"fp_changed": fp2 != (stash.get("fp") or fp2),
+                  "hard": drift["changes"], "soft": drift["soft"],
+                  "tier": f"{d_old.tier}->{d2.tier}"},
+                 "stale" if drift["hard"] else "ok")
+
+    if drift["hard"]:
+        # 用最新状态重建确认卡：用户看到的就是"即将执行"的那一版
+        _stash_pending(s, plan, fresh, ctx2, d2, slots, intent, inj)
+        card = _confirm_card(plan, slots, fresh, d2,
+                             extra_rows=[["已变化", c] for c in drift["changes"]],
+                             note="情况有变，请重新确认；说「取消」随时终止")
+        return _resp(s, trace, "这笔的状态发生了变化，需要您重新确认一次。", card,
+                     {"stale": True, "changes": drift["changes"],
+                      "decision": d2.to_dict()}, t0)
+
+    # 3) 抢占：用户连点两次 / 两个 worker 同时收到确认，只有一个能真正执行
+    if not fsm.claim(s, p, {**stash, "fp": fp2, "snapshot": snap2}):
+        audit.append(trace, "confirm_duplicate", {}, "ok")
+        return _resp(s, trace, "这笔已经在处理了，请勿重复确认。",
+                     _notice("info", "处理中", ["同一笔只会执行一次"]),
+                     {"duplicate_confirm": True}, t0)
+
+    # 4) 执行：幂等种子用 confirm_id，跨重试稳定
+    try:
+        out = executor.run(plan, "commit", trace, fresh, principal=p, idem_seed=confirm_id)
     except YinshuError as e:
         audit.append(trace, "execute_failed", {"code": e.code}, "error")
         fsm.reset(s)
         msg = e.user_msg or "执行失败，请稍后再试。"
         return _resp(s, trace, msg, _notice("danger", "执行未完成", [msg]),
-                     {"error": e.code, "compensated": out.compensated}, t0)
+                     {"error": e.code, "compensated": fresh.compensated}, t0)
 
-    text_out, card, extra = build_presentation(intent, plan, out, d, slots)
+    text_out, card, extra = build_presentation(intent, plan, out, d2, slots)
     bad = guard.check(text_out, executor.facts(slots, out.results, extra))
     if bad:
         text_out = "操作已完成，详细结果见下方卡片。"
         audit.append(trace, "guard_rewrite", {"violations": bad}, "ok")
-    audit.append(trace, "execute_ok", {"intent": intent, "compensated": out.compensated}, "ok")
+    if drift["soft"]:
+        audit.append(trace, "confirm_drift", {"soft": drift["soft"]}, "ok")
+        if isinstance(card, dict):
+            card = {**card, "drift": drift["soft"]}
+    audit.append(trace, "execute_ok", {"intent": intent, "confirm_id": confirm_id,
+                                       "compensated": fresh.compensated}, "ok")
+    fsm.finish(s, "EXECUTED")
     fsm.reset(s)
     return _resp(s, trace, text_out, card,
-                 {"decision": d.to_dict(), "guard_violations": bad,
-                  "compensated": out.compensated}, t0)
+                 {"decision": d2.to_dict(), "guard_violations": bad,
+                  "compensated": fresh.compensated, "drift": drift["soft"]}, t0)
 
 
 def _resp(s: fsm.Session, trace: str, reply: str, card: dict | None, debug: dict, t0: float) -> dict:

@@ -21,9 +21,24 @@ def _bank_count(table: str) -> int:
         c.close()
 
 
+@pytest.fixture()
+def clean_bank():
+    """把银行数据重置到种子状态。
+
+    这两条用例要断言"只多了一笔转账"，而 `velocity_1h`（1 小时内资金操作次数）
+    是全套测试共享的银行状态：前面用例多转几笔，"给我妈转500"就会 +12 分
+    越档变成 CONFIRM。不重置就是典型的顺序依赖。
+    """
+    from backend.mock_bank import seed as seed_mod
+
+    # 只重灌数据，不删库文件——进程内的 Mock 核心还开着连接，删文件会 WinError 32
+    seed_mod.seed()
+    yield
+
+
 # ---------------------------------------------------------------- 幂等
 
-def test_same_idempotency_key_executes_once(client):
+def test_same_idempotency_key_executes_once(client, clean_bank):
     """同一幂等键重放，第二次必须回放首次响应，且银行侧只多一笔。"""
     before = _bank_count("transfers")
     headers = {"X-Idempotency-Key": "idem-transfer-001"}
@@ -42,7 +57,7 @@ def test_same_idempotency_key_executes_once(client):
     assert _bank_count("transfers") == after_first, "重放了却仍然扣了钱"
 
 
-def test_replayed_request_does_not_duplicate_when_body_identical(client):
+def test_replayed_request_does_not_duplicate_when_body_identical(client, clean_bank):
     """不带显式 key 时，同主体 + 同请求体也应被认成同一笔。"""
     body = {"text": "给我妈转300"}
     before = _bank_count("transfers")
