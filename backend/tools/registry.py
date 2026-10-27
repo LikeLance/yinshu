@@ -43,11 +43,13 @@ _reg(ToolSpec("account.balance", "GET", "/v1/accounts/{account_id}/balance",
               {"account_id": int, "last4": str}, ("account_id",), desc="查询单账户余额"))
 _reg(ToolSpec("payee.search", "GET", "/v1/payees/search", {"q": str}, ("q",), desc="按姓名/关系检索收款人"))
 _reg(ToolSpec("risk.stats", "GET", "/v1/risk/stats", desc="读取风控特征（频率/白名单）"))
+# account_id 不再给默认值 1：不传时由核心系统按调用方身份取默认账户，
+# 传了则核心系统校验归属。写死 1 会让第二个客户读到第一个客户的账。
 _reg(ToolSpec("bill.summary", "GET", "/v1/bills/summary",
-              {"from": str, "to": str, "account_id": int}, ("from", "to"), {"account_id": 1},
+              {"from": str, "to": str, "account_id": int}, ("from", "to"), {},
               desc="账单分类汇总"))
 _reg(ToolSpec("bill.anomalies", "GET", "/v1/bills/anomalies",
-              {"from": str, "to": str, "account_id": int}, ("from", "to"), {"account_id": 1},
+              {"from": str, "to": str, "account_id": int}, ("from", "to"), {},
               desc="异常交易识别"))
 _reg(ToolSpec("wealth.products", "GET", "/v1/wealth/products",
               {"risk_max": str, "term_max": int, "keyword": str}, (), {"risk_max": "R3", "term_max": 9999},

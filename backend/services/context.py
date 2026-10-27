@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import time
 from decimal import Decimal
+from typing import Any
 
 from backend.core import clock
 from backend.core.errors import YinshuError
@@ -138,3 +140,46 @@ def compute_drift(old: dict, new: dict, fp_old: str | None, fp_new: str,
         soft.append(f"可用余额：{old.get('balance')} → {new.get('balance')}")
 
     return {"hard": bool(hard), "changes": hard, "soft": soft}
+
+
+# ---------------- 账户解析（多租户） ----------------
+
+_ACCT_CACHE: dict[int, tuple[float, int]] = {}
+_ACCT_TTL = 60.0
+
+
+def account_of(principal: Any = None) -> int:
+    """当前主体的默认扣款账户。
+
+    原实现把 `ACCOUNT_ID = 1` 写死在规划器里，第二个客户的钱会从
+    第一个客户的账户进出。账户是 per-user 的数据，必须按主体解析。
+
+    60 秒缓存：一次对话里可能连续规划多轮，避免每轮都打一次核心系统；
+    代价是"刚开户立刻转账"可能拿到旧值，所以失败时兜底到演示账户，
+    真正动钱之前核心系统还有一次归属校验（失败关闭）。
+    """
+    from backend.core import config, reqctx
+
+    p = principal if principal is not None else reqctx.principal()
+    owner = int(getattr(p, "uid", 0) or config.DEMO_USER_ID)
+    hit = _ACCT_CACHE.get(owner)
+    if hit and time.time() - hit[0] < _ACCT_TTL:
+        return hit[1]
+
+    # 只兜"下游不可用"，不兜编程错误：把 TypeError/ValueError 也吞掉，
+    # 会让"少传一个参数"这种 bug 静默退化成"用兜底账户"，而兜底账户是用户 1 的。
+    try:
+        data = gateway.call("account.list", {})
+    except YinshuError:
+        data = {}
+    accounts = data.get("accounts") or []
+    picked = next((a for a in accounts if a.get("kind") == "活期"),
+                  accounts[0] if accounts else None)
+    aid = int(picked["id"]) if picked else config.DEMO_ACCOUNT_ID
+    _ACCT_CACHE[owner] = (time.time(), aid)
+    return aid
+
+
+def forget_account(owner: int) -> None:
+    """测试用：清掉账户缓存。"""
+    _ACCT_CACHE.pop(owner, None)

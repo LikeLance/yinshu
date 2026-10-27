@@ -16,7 +16,10 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
+from contextvars import ContextVar
+
 from fastapi import Body, FastAPI, Header, HTTPException, Query
+from starlette.middleware.base import BaseHTTPMiddleware
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.mock_bank.db import D, connect, init_db, mq
@@ -49,7 +52,7 @@ def _uid(x_user_id: str | None) -> int:
         raise HTTPException(400, {"code": "BAD_USER", "message": "X-User-Id 非法"})
 
 
-def _own(table: str, row_id: int, uid: int, what: str) -> None:
+def _own(table: str, row_id: int, owner: int, what: str) -> None:
     """归属校验：不是自己的资源一律拒绝，**失败关闭**。
 
     没有这一步，一旦上游把账户/收款人传错，"多租户"就会变成"跨用户动钱"。
@@ -58,8 +61,56 @@ def _own(table: str, row_id: int, uid: int, what: str) -> None:
     r = _conn.execute(f"SELECT user_id FROM {table} WHERE id=?", (row_id,)).fetchone()
     if not r:
         raise HTTPException(404, {"code": "NOT_FOUND", "message": f"{what}不存在"})
-    if int(r["user_id"]) != uid:
+    if int(r["user_id"]) != owner:
         raise HTTPException(403, {"code": "FORBIDDEN", "message": f"{what}不属于当前用户"})
+
+
+_UID: ContextVar[int] = ContextVar("mock_uid", default=1)
+
+
+def uid() -> int:
+    """当前请求的操作主体，由 Identity 中间件从 X-User-Id 注入。"""
+    return _UID.get()
+
+
+class Identity(BaseHTTPMiddleware):
+    """把上游网关校验过的主体注入请求上下文。
+
+    Mock 核心只监听 127.0.0.1，这一跳的信任来自"内网 + 网关已鉴权"；
+    真实银行应换成 mTLS / 服务网格身份，而不是裸 header。
+
+    为什么不用 `?user_id=` 查询参数：那是**可伪造**的，
+    传一个别人的 id 就能读别人的账户。身份只能来自请求上下文。
+    """
+
+    async def dispatch(self, request, call_next):
+        token = _UID.set(_uid(request.headers.get("x-user-id")))
+        try:
+            return await call_next(request)
+        finally:
+            _UID.reset(token)
+
+
+app.add_middleware(Identity)
+
+
+def _default_account(owner: int | None = None) -> int:
+    """调用方的默认扣款账户（存在活期就优先活期）。多账户时不做猜测，只按类型取。"""
+    owner = uid() if owner is None else owner
+    row = _conn.execute(
+        "SELECT id FROM accounts WHERE user_id=? ORDER BY (kind='活期') DESC, id LIMIT 1",
+        (owner,)).fetchone()
+    if not row:
+        raise HTTPException(404, {"code": "NO_ACCOUNT", "message": "当前用户名下没有可用账户"})
+    return int(row["id"])
+
+
+def _account_or_default(account_id: int | None) -> int:
+    """显式传了账户就校验归属，没传就用默认账户——绝不跨用户兜底。"""
+    if account_id is None:
+        return _default_account()
+    _own("accounts", account_id, uid(), "账户")
+    return int(account_id)
 
 
 def _row2dict(r) -> dict:
@@ -105,13 +156,14 @@ def admin_reset():
 
 
 @app.get("/v1/accounts")
-def list_accounts(user_id: int = 1):
-    rows = _conn.execute("SELECT * FROM accounts WHERE user_id=?", (user_id,)).fetchall()
+def list_accounts():
+    rows = _conn.execute("SELECT * FROM accounts WHERE user_id=?", (uid(),)).fetchall()
     return {"accounts": [_row2dict(r) for r in rows]}
 
 
 @app.get("/v1/accounts/{account_id}/balance")
 def balance(account_id: int):
+    _own("accounts", account_id, uid(), "账户")
     r = _conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
     if not r:
         raise HTTPException(404, {"code": "ACCOUNT_NOT_FOUND", "message": "账户不存在"})
@@ -121,13 +173,13 @@ def balance(account_id: int):
 # ---------------- 收款人 ----------------
 
 @app.get("/v1/payees")
-def all_payees(user_id: int = 1):
-    rows = _conn.execute("SELECT * FROM payees WHERE user_id=?", (user_id,)).fetchall()
+def all_payees():
+    rows = _conn.execute("SELECT * FROM payees WHERE user_id=?", (uid(),)).fetchall()
     return {"payees": [_row2dict(r) for r in rows]}
 
 
 @app.get("/v1/payees/search")
-def search_payee(q: str = Query(..., min_length=1), user_id: int = 1):
+def search_payee(q: str = Query(..., min_length=1)):
     """模糊匹配：人名全等 > 关系匹配 > 编辑距离。返回 top-5 + 相似度。"""
     import difflib
 
@@ -138,7 +190,7 @@ def search_payee(q: str = Query(..., min_length=1), user_id: int = 1):
              "老婆": "妻子", "媳妇": "妻子", "老公": "丈夫",
              "房东": "房东", "老板": "房东"}
     q = ALIAS.get(q, q)
-    rows = _conn.execute("SELECT * FROM payees WHERE user_id=?", (user_id,)).fetchall()
+    rows = _conn.execute("SELECT * FROM payees WHERE user_id=?", (uid(),)).fetchall()
     out = []
     for r in rows:
         ratio = difflib.SequenceMatcher(None, q, r["name"]).ratio()
@@ -186,11 +238,15 @@ def create_transfer(payload: dict = Body(...), idempotency_key: str | None = Hea
     payee_id = int(payload["payee_id"])
     memo = payload.get("memo") or ""
 
+    # 归属校验必须在动钱之前：账户与收款人都得是本人的
+    _own("accounts", account_id, uid(), "账户")
+    _own("payees", payee_id, uid(), "收款人")
+
     if amount <= 0:
         raise HTTPException(400, {"code": "INVALID_AMOUNT", "message": "金额必须大于 0"})
     if amount > SINGLE_LIMIT:
         raise HTTPException(400, {"code": "LIMIT_EXCEEDED", "message": f"单笔限额 {mq(SINGLE_LIMIT)} 元"})
-    if _today_sum(payload.get("user_id", 1)) + amount > DAILY_LIMIT:
+    if _today_sum(uid()) + amount > DAILY_LIMIT:
         raise HTTPException(400, {"code": "LIMIT_EXCEEDED", "message": f"日累计限额 {mq(DAILY_LIMIT)} 元"})
 
     acc = _conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
@@ -208,7 +264,7 @@ def create_transfer(payload: dict = Body(...), idempotency_key: str | None = Hea
     cur = _conn.execute(
         "INSERT INTO transfers(user_id,account_id,payee_id,amount,memo,kind,status,created_at,idem_key)"
         " VALUES(?,?,?,?,?,?,?,?,?)",
-        (payload.get("user_id", 1), account_id, payee_id, mq(amount), memo, "instant", "done", now, idempotency_key),
+        (uid(), account_id, payee_id, mq(amount), memo, "instant", "done", now, idempotency_key),
     )
     _conn.execute(
         "INSERT INTO transactions(account_id,ts,merchant,category,sub_category,amount,direction,city,note)"
@@ -243,13 +299,15 @@ def schedule_transfer(payload: dict = Body(...), idempotency_key: str | None = H
     payee = _conn.execute("SELECT * FROM payees WHERE id=?", (int(payload["payee_id"]),)).fetchone()
     if not payee:
         raise HTTPException(404, {"code": "NOT_FOUND", "message": "收款人不存在"})
+    _own("accounts", int(payload["account_id"]), uid(), "账户")
+    _own("payees", int(payload["payee_id"]), uid(), "收款人")
     if amount > SINGLE_LIMIT:
         raise HTTPException(400, {"code": "LIMIT_EXCEEDED", "message": f"单笔限额 {mq(SINGLE_LIMIT)} 元"})
 
     cur = _conn.execute(
         "INSERT INTO transfers(user_id,account_id,payee_id,amount,memo,kind,status,created_at,first_run_at,recurrence,idem_key)"
         " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-        (payload.get("user_id", 1), int(payload["account_id"]), int(payload["payee_id"]), mq(amount),
+        (uid(), int(payload["account_id"]), int(payload["payee_id"]), mq(amount),
          payload.get("memo") or "", "scheduled", "pending", _now(),
          payload["first_run_at"], payload.get("recurrence"), idempotency_key),
     )
@@ -292,10 +350,10 @@ def collect_aa(payload: dict = Body(...), idempotency_key: str | None = Header(d
 
 
 @app.get("/v1/transfers")
-def list_transfers(user_id: int = 1, limit: int = 10):
+def list_transfers(limit: int = 10):
     rows = _conn.execute(
         "SELECT t.*, p.name AS payee_name FROM transfers t LEFT JOIN payees p ON p.id=t.payee_id"
-        " WHERE t.user_id=? ORDER BY t.id DESC LIMIT ?", (user_id, limit)).fetchall()
+        " WHERE t.user_id=? ORDER BY t.id DESC LIMIT ?", (uid(), limit)).fetchall()
     return {"transfers": [_row2dict(r) for r in rows]}
 
 
@@ -303,7 +361,8 @@ def list_transfers(user_id: int = 1, limit: int = 10):
 
 @app.get("/v1/bills/summary")
 def bill_summary(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"),
-                 account_id: int = 1):
+                 account_id: int | None = None):
+    account_id = _account_or_default(account_id)
     rows = _conn.execute(
         "SELECT category, COUNT(*) c, SUM(CAST(amount AS REAL)) s FROM transactions"
         " WHERE account_id=? AND direction='out' AND substr(ts,1,10) BETWEEN ? AND ?"
@@ -352,7 +411,8 @@ def bill_summary(date_from: str = Query(..., alias="from"), date_to: str = Query
 
 @app.get("/v1/bills/transactions")
 def bill_transactions(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"),
-                      category: str | None = None, account_id: int = 1, limit: int = 50):
+                      category: str | None = None, account_id: int | None = None, limit: int = 50):
+    account_id = _account_or_default(account_id)
     sql = ("SELECT * FROM transactions WHERE account_id=? AND substr(ts,1,10) BETWEEN ? AND ?")
     args: list[Any] = [account_id, date_from, date_to]
     if category:
@@ -366,7 +426,8 @@ def bill_transactions(date_from: str = Query(..., alias="from"), date_to: str = 
 
 @app.get("/v1/bills/anomalies")
 def bill_anomalies(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"),
-                   account_id: int = 1):
+                   account_id: int | None = None):
+    account_id = _account_or_default(account_id)
     """异常识别全部在服务端按规则算，模型只负责解释，不负责判定。"""
     rows = _conn.execute(
         "SELECT * FROM transactions WHERE account_id=? AND direction='out'"
@@ -475,9 +536,9 @@ def risk_profile(payload: dict = Body(default={})):
 
 
 @app.get("/v1/wealth/holdings")
-def holdings(user_id: int = 1):
+def holdings():
     rows = _conn.execute("SELECT h.*, p.name, p.annual_rate FROM holdings h JOIN products p ON p.id=h.product_id"
-                         " WHERE h.user_id=? ORDER BY h.id DESC", (user_id,)).fetchall()
+                         " WHERE h.user_id=? ORDER BY h.id DESC", (uid(),)).fetchall()
     return {"holdings": [_row2dict(r) for r in rows]}
 
 
@@ -486,7 +547,9 @@ def wealth_order(payload: dict = Body(...), idempotency_key: str | None = Header
     product = _conn.execute("SELECT * FROM products WHERE id=?", (payload["product_id"],)).fetchone()
     if not product:
         raise HTTPException(404, {"code": "PRODUCT_NOT_FOUND", "message": "产品不存在"})
-    user = _conn.execute("SELECT * FROM users WHERE id=1").fetchone()
+    user = _conn.execute("SELECT * FROM users WHERE id=?", (uid(),)).fetchone()
+    if not user:
+        raise HTTPException(404, {"code": "USER_NOT_FOUND", "message": "用户不存在"})
     if RISK_ORDER[product["risk"]] > CUSTOMER_ORDER[user["risk_level"]]:
         raise HTTPException(400, {"code": "UNSUITABLE",
                                  "message": f"该产品风险等级 {product['risk']} 高于您的承受能力 {user['risk_level']}"})
@@ -494,13 +557,15 @@ def wealth_order(payload: dict = Body(...), idempotency_key: str | None = Header
     if amount < D(product["min_amount"]):
         raise HTTPException(400, {"code": "BELOW_MIN",
                                  "message": f"起购金额 {product['min_amount']} 元"})
-    acc = _conn.execute("SELECT * FROM accounts WHERE id=1").fetchone()
+    account_id = _default_account()
+    acc = _conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
     if D(acc["balance"]) < amount:
         raise HTTPException(400, {"code": "INSUFFICIENT_FUNDS",
                                  "message": f"余额不足，可用 {mq(acc['balance'])} 元"})
-    _conn.execute("UPDATE accounts SET balance=? WHERE id=1", (mq(D(acc["balance"]) - amount),))
-    cur = _conn.execute("INSERT INTO holdings(user_id,product_id,amount,ts) VALUES(1,?,?,?)",
-                        (product["id"], mq(amount), _now()))
+    _conn.execute("UPDATE accounts SET balance=? WHERE id=?",
+                  (mq(D(acc["balance"]) - amount), account_id))
+    cur = _conn.execute("INSERT INTO holdings(user_id,product_id,amount,ts) VALUES(?,?,?,?)",
+                        (uid(), product["id"], mq(amount), _now()))
     _conn.commit()
     return {"order_id": cur.lastrowid, "product": product["name"], "amount": mq(amount),
             "status": "confirmed_pending", "confirm_note": "T+1 确认份额，份额以确认结果为准",
@@ -513,11 +578,15 @@ def wealth_redeem(payload: dict = Body(...)):
                       " WHERE h.id=?", (int(payload["holding_id"]),)).fetchone()
     if not h:
         raise HTTPException(404, {"code": "HOLDING_NOT_FOUND", "message": "持仓不存在"})
+    if int(h["user_id"]) != uid():
+        raise HTTPException(403, {"code": "FORBIDDEN", "message": "持仓不属于当前用户"})
     amount = D(payload.get("amount") or h["amount"])
     if amount > D(h["amount"]):
         raise HTTPException(400, {"code": "EXCEED_HOLDING", "message": "赎回金额超过持仓"})
-    acc = _conn.execute("SELECT * FROM accounts WHERE id=1").fetchone()
-    _conn.execute("UPDATE accounts SET balance=? WHERE id=1", (mq(D(acc["balance"]) + amount),))
+    account_id = _default_account()
+    acc = _conn.execute("SELECT * FROM accounts WHERE id=?", (account_id,)).fetchone()
+    _conn.execute("UPDATE accounts SET balance=? WHERE id=?",
+                  (mq(D(acc["balance"]) + amount), account_id))
     _conn.execute("UPDATE holdings SET amount=? WHERE id=?", (mq(D(h["amount"]) - amount), int(payload["holding_id"])))
     _conn.commit()
     return {"holding_id": int(payload["holding_id"]), "product": h["name"], "amount": mq(amount),
@@ -527,8 +596,8 @@ def wealth_redeem(payload: dict = Body(...)):
 # ---------------- 卡片 ----------------
 
 @app.get("/v1/cards")
-def list_cards(user_id: int = 1):
-    rows = _conn.execute("SELECT * FROM cards WHERE user_id=?", (user_id,)).fetchall()
+def list_cards():
+    rows = _conn.execute("SELECT * FROM cards WHERE user_id=?", (uid(),)).fetchall()
     return {"cards": [_row2dict(r) for r in rows]}
 
 
@@ -541,6 +610,7 @@ def card_apply(payload: dict = Body(default={})):
 
 @app.patch("/v1/cards/{card_id}/limit")
 def card_limit(card_id: int, payload: dict = Body(...)):
+    _own("cards", card_id, uid(), "卡片")
     r = _conn.execute("SELECT * FROM cards WHERE id=?", (card_id,)).fetchone()
     if not r:
         raise HTTPException(404, {"code": "CARD_NOT_FOUND", "message": "卡片不存在"})
@@ -556,6 +626,7 @@ def card_limit(card_id: int, payload: dict = Body(...)):
 
 @app.post("/v1/cards/{card_id}/freeze")
 def card_freeze(card_id: int, payload: dict = Body(default={})):
+    _own("cards", card_id, uid(), "卡片")
     frozen = 1 if payload.get("freeze", True) else 0
     _conn.execute("UPDATE cards SET frozen=?, status=? WHERE id=?",
                   (frozen, "frozen" if frozen else "active", card_id))
@@ -567,6 +638,7 @@ def card_freeze(card_id: int, payload: dict = Body(default={})):
 
 @app.post("/v1/cards/{card_id}/loss")
 def card_loss(card_id: int):
+    _own("cards", card_id, uid(), "卡片")
     _conn.execute("UPDATE cards SET status='lost', frozen=1 WHERE id=?", (card_id,))
     _conn.commit()
     return {"card_id": card_id, "status": "lost", "irreversible": True,
@@ -577,8 +649,9 @@ def card_loss(card_id: int):
 # ---------------- 订阅 ----------------
 
 @app.get("/v1/subscriptions")
-def subs(user_id: int = 1):
-    rows = _conn.execute("SELECT * FROM subscriptions WHERE user_id=? AND status='active'", (user_id,)).fetchall()
+def subs():
+    rows = _conn.execute("SELECT * FROM subscriptions WHERE user_id=? AND status='active'",
+                         (uid(),)).fetchall()
     items, annual = [], Decimal("0")
     for r in rows:
         per_year = {"月": D(r["amount"]) * 12, "季": D(r["amount"]) * 4, "年": D(r["amount"])}[r["cycle"]]
@@ -591,6 +664,7 @@ def subs(user_id: int = 1):
 
 @app.post("/v1/subscriptions/{sub_id}/cancel")
 def sub_cancel(sub_id: int):
+    _own("subscriptions", sub_id, uid(), "订阅")
     r = _conn.execute("SELECT * FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
     if not r:
         raise HTTPException(404, {"code": "SUB_NOT_FOUND", "message": "订阅不存在"})
@@ -603,21 +677,21 @@ def sub_cancel(sub_id: int):
 # ---------------- 风控辅助 ----------------
 
 @app.get("/v1/risk/stats")
-def risk_stats(user_id: int = 1):
+def risk_stats():
     one_hour_ago = (datetime.now() - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
     velocity = _conn.execute(
         "SELECT COUNT(*) c FROM transfers WHERE user_id=? AND kind IN ('instant','scheduled','collect')"
-        " AND created_at>=?", (user_id, one_hour_ago)).fetchone()["c"]
+        " AND created_at>=?", (uid(), one_hour_ago)).fetchone()["c"]
     today = date.today().isoformat()
     daily = _conn.execute(
-        "SELECT COUNT(*) c FROM transfers WHERE user_id=? AND substr(created_at,1,10)=?", (user_id, today)
+        "SELECT COUNT(*) c FROM transfers WHERE user_id=? AND substr(created_at,1,10)=?", (uid(), today)
     ).fetchone()["c"]
     known = _conn.execute(
-        "SELECT DISTINCT payee_id FROM transfers WHERE user_id=?", (user_id,)).fetchall()
+        "SELECT DISTINCT payee_id FROM transfers WHERE user_id=?", (uid(),)).fetchall()
     recent = _conn.execute(
         "SELECT DISTINCT payee_id FROM transfers WHERE user_id=? AND created_at>=?",
-        (user_id, (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"))).fetchall()
-    user = _conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        (uid(), (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S"))).fetchall()
+    user = _conn.execute("SELECT * FROM users WHERE id=?", (uid(),)).fetchone()
     return {"velocity_1h": velocity, "daily_count": daily,
             "known_payees": [r["payee_id"] for r in known],
             "recent_payees": [r["payee_id"] for r in recent],
@@ -643,8 +717,8 @@ def create_hold(payload: dict = Body(...), idempotency_key: str | None = Header(
                 "expire_at": hit["expire_at"], "idempotent_replay": True}
     cur = _conn.execute(
         "INSERT INTO holds(user_id,amount,reason,status,expire_at,created_at,idem_key)"
-        " VALUES(1,?,?,?,?,?,?)",
-        (mq(D(payload["amount"])), payload.get("reason", "跨场景资金锁定"),
+        " VALUES(?,?,?,?,?,?,?)",
+        (uid(), mq(D(payload["amount"])), payload.get("reason", "跨场景资金锁定"),
          "held", payload.get("expire_at"), _now(), idempotency_key))
     _conn.commit()
     return {"hold_id": cur.lastrowid, "amount": mq(D(payload["amount"])), "status": "held",
@@ -653,6 +727,7 @@ def create_hold(payload: dict = Body(...), idempotency_key: str | None = Header(
 
 @app.post("/v1/holds/{hold_id}/release")
 def release_hold(hold_id: int, idempotency_key: str | None = Header(default=None)):
+    _own("holds", hold_id, uid(), "资金锁定")
     _conn.execute("UPDATE holds SET status='released' WHERE id=?", (hold_id,))
     _conn.commit()
     r = _conn.execute("SELECT * FROM holds WHERE id=?", (hold_id,)).fetchone()
@@ -678,8 +753,10 @@ def gift_order(payload: dict = Body(...)):
     g = next((x for x in GIFTS if x["gift_id"] == payload["gift_id"]), None)
     if not g:
         raise HTTPException(404, {"code": "GIFT_NOT_FOUND", "message": "商品不存在"})
-    cur = _conn.execute("INSERT INTO gift_orders(user_id,gift_id,name,amount,status,created_at) VALUES(1,?,?,?,?,?)",
-                        (g["gift_id"], g["name"], g["amount"], "created", _now()))
+    cur = _conn.execute(
+        "INSERT INTO gift_orders(user_id,gift_id,name,amount,status,created_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (uid(), g["gift_id"], g["name"], g["amount"], "created", _now()))
     _conn.commit()
     return {"order_id": cur.lastrowid, "gift_id": g["gift_id"], "name": g["name"],
             "amount": g["amount"], "vendor": g["vendor"], "status": "created",
@@ -688,5 +765,6 @@ def gift_order(payload: dict = Body(...)):
 
 @app.get("/v1/partner/gift/orders")
 def gift_orders():
-    rows = _conn.execute("SELECT * FROM gift_orders ORDER BY id DESC LIMIT 10").fetchall()
+    rows = _conn.execute("SELECT * FROM gift_orders WHERE user_id=? ORDER BY id DESC LIMIT 10",
+                         (uid(),)).fetchall()
     return {"orders": [_row2dict(r) for r in rows]}

@@ -15,6 +15,8 @@ from decimal import Decimal
 from backend.core.config import DEMO_USER_ID
 from backend.planner.contracts import Plan, Step
 
+# 演示/兜底用；真实账户由 `build(..., account_id=...)` 从调用方身份解析后传入。
+# 注意：不要把这里当成"用户 1 的账户"——多租户下账户是 per-user 的。
 ACCOUNT_ID = 1
 
 
@@ -26,8 +28,14 @@ def _missing_plan(intent: str, missing: list[str], slots: dict) -> Plan:
     return Plan(intent=intent, slots=slots, steps=[], missing=missing)
 
 
-def build(intent: str, slots: dict) -> Plan:
+def build(intent: str, slots: dict, account_id: int = ACCOUNT_ID) -> Plan:
+    """意图 + 槽位 → 模板 DAG。
+
+    `account_id` 必须由调用方按**当前主体**解析后传入（见 services.context.account_of）：
+    写死成 1 会让第二个客户的钱从第一个客户的账户进出。
+    """
     s = dict(slots)
+    acct = int(account_id or ACCOUNT_ID)
     amt = s.get("amount")
     when = s.get("when") or {}
 
@@ -45,17 +53,17 @@ def build(intent: str, slots: dict) -> Plan:
 
         steps = [
             Step(id="s1", tool="payee.search", args={"q": s["payee_raw"]}, label=f"检索收款人「{s['payee_raw']}」"),
-            Step(id="s2", tool="account.balance", args={"account_id": ACCOUNT_ID}, label="查询可用余额"),
+            Step(id="s2", tool="account.balance", args={"account_id": acct}, label="查询可用余额"),
         ]
         if intent == "transfer.create":
             steps.append(Step(id="s3", tool="transfer.create",
-                              args={"account_id": ACCOUNT_ID, "payee_id": "$s1.chosen",
+                              args={"account_id": acct, "payee_id": "$s1.chosen",
                                     "amount": _amount(amt), "memo": s.get("memo") or ""},
                               label="发起转账", on_fail="abort"))
         else:
             first_run = f"{when['date']} {when.get('time') or '09:00'}:00"
             steps.append(Step(id="s3", tool="transfer.schedule",
-                              args={"account_id": ACCOUNT_ID, "payee_id": "$s1.chosen",
+                              args={"account_id": acct, "payee_id": "$s1.chosen",
                                     "amount": _amount(amt), "memo": s.get("memo") or "",
                                     "first_run_at": first_run,
                                     "recurrence": when.get("recurrence") or "once"},

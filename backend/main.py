@@ -36,8 +36,8 @@ from backend.presenter import build as build_presentation, plan_card
 from backend.security import audit, guard, identity, injection, policy
 from backend.services.choose import choose_response, merge_clarify, pick_option
 from backend.services.confirm import confirm_card, execute_pending, stash_pending
-from backend.services.context import (build_context, compute_drift, risk_stats,
-                                      take_snapshot)
+from backend.services.context import (account_of, build_context, compute_drift,
+                                      risk_stats, take_snapshot)
 from backend.services.view import (build_response, card_text, first_of, guard_check,
                                    jsonable, notice, scan_tool_output)
 from backend.session import fsm
@@ -146,7 +146,10 @@ class ChatReq(BaseModel):
 
 def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
             inj: bool, forced_payee: int | None = None) -> dict:
-    plan = planner.build(intent, slots)
+    # 账户是按主体解析的：只有转账类需要（账单由核心系统按调用方身份取默认账户）。
+    # 写死 ACCOUNT_ID=1 会让第二个客户的钱从第一个客户的账户进出。
+    account_id = account_of() if intent.startswith("transfer") else planner.ACCOUNT_ID
+    plan = planner.build(intent, slots, account_id)
     if plan.missing:
         q = {"payee": "转给谁？说姓名或关系就行（比如「妈」「李慧」）。",
              "amount": "转多少？",

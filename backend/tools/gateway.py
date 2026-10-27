@@ -114,6 +114,15 @@ def _raise_for(resp: httpx.Response) -> None:
     raise exc(f"{code}: {msg}", user_msg=msg or "银行系统处理失败")
 
 
+def _hdr_safe(v: str) -> str:
+    """幂等键要写进 HTTP 头，必须是 ASCII。
+
+    trace_id 可能来自客户端的 X-Request-Id（可伪造），直接拼进头会抛
+    UnicodeEncodeError → 整个请求 500。这里做一次无损降级：非 ASCII 替换掉。
+    """
+    return str(v).encode("ascii", "replace").decode("ascii")
+
+
 def _idem_key(name: str, step_id: str, principal: Any, idem_seed: str | None,
               trace_id: str) -> str:
     """确定性幂等键。
@@ -127,8 +136,8 @@ def _idem_key(name: str, step_id: str, principal: Any, idem_seed: str | None,
     from backend.core import reqctx
 
     uid = int(getattr(principal, "uid", 0) or 0)
-    seed = idem_seed or reqctx.idem_seed() or trace_id or "t"
-    return f"yinshu:v2:{uid}:{name}:{seed}:{step_id or name}"
+    seed = _hdr_safe(idem_seed or reqctx.idem_seed() or trace_id or "t")
+    return f"yinshu:v2:{uid}:{name}:{seed}:{_hdr_safe(step_id or name)}"
 
 
 def call(name: str, args: dict, trace_id: str = "", step_id: str = "",
@@ -166,7 +175,10 @@ def call(name: str, args: dict, trace_id: str = "", step_id: str = "",
         try:
             c = client()
             if spec.method == "GET":
-                r = c.get(url, params={k: v for k, v in a.items() if v is not None})
+                # 请求头走 GET 也要带上：X-User-Id 是核心系统做数据隔离的依据，
+                # 漏了它所有读请求都会退化成"用户 1"。
+                r = c.get(url, params={k: v for k, v in a.items() if v is not None},
+                          headers=headers)
             elif spec.method == "POST":
                 r = c.post(url, json=a, headers=headers)
             elif spec.method == "PATCH":

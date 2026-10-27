@@ -83,4 +83,6 @@ IDEMPOTENCY_AUTO_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_AUTO_TTL", "600"))
 IDEMPOTENCY_INFLIGHT_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_INFLIGHT_TTL", "30"))
 
 DEMO_USER_ID = int(os.getenv("YINSHU_USER_ID", "1"))
+# 兜底账户（仅核心系统不可用/无账户时使用）；正常路径按主体解析真实账户
+DEMO_ACCOUNT_ID = int(os.getenv("YINSHU_ACCOUNT_ID", "1"))
 APP_VERSION = "1.1.0"

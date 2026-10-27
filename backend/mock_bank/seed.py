@@ -89,6 +89,14 @@ def seed() -> None:
     cur.execute("INSERT INTO cards(id,user_id,account_id,last4,brand,daily_limit,status,frozen)"
                 " VALUES(2,1,1,'3301','银联金卡','20000.00','active',0)")
 
+    # 第二个客户：用来验证"多租户隔离"（身份从 X-User-Id 来，不靠 ?user_id= 猜）
+    cur.execute("INSERT INTO users(id,name,segment,risk_level,phone,birthday)"
+                " VALUES(2,'李雷','普通','C2','139****0001','1995-08-08')")
+    cur.execute("INSERT INTO accounts(id,user_id,kind,last4,balance)"
+                " VALUES(3,2,'活期','5566','12000.00')")
+    cur.execute("INSERT INTO cards(id,user_id,account_id,last4,brand,daily_limit,status,frozen)"
+                " VALUES(3,2,3,'9900','银联普卡','10000.00','active',0)")
+
     # ---------- 通讯录（含同名、黑名单、跨境） ----------
     payees = [
         (1, "李慧", "138****3921", "招商银行", "3921", "母亲", "绵阳", 0),
@@ -99,6 +107,11 @@ def seed() -> None:
         (6, "刘洋", "131****9900", "邮储银行", "9900", "朋友", "绵阳", 1),   # 黑名单
         (7, "赵敏", "852-****1234", "HSBC HK", "1234", "同事", "香港", 0),  # 跨境（见下方 cross_border）
     ]
+    # 客户 2 自己的收款人（id=8）。注意：它**不能**出现在客户 1 的通讯录里，
+    # 反之亦然——隔离测试就是靠这个断言的。
+    cur.execute("INSERT INTO payees(id,user_id,name,phone,bank,account_last4,relation,"
+                "city,blacklisted,cross_border,created_at) VALUES(8,2,'韩梅梅','137****0002',"
+                "'中国银行','0002','同事','绵阳',0,0,'2024-03-01 10:00:00')")
     for pid, name, phone, bank, last4, rel, city, bl in payees:
         cur.execute("INSERT INTO payees(id,user_id,name,phone,bank,account_last4,relation,"
                     "city,blacklisted,cross_border,created_at) VALUES(?,1,?,?,?,?,?,?,?,?,?)",
