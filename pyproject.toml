@@ -6,6 +6,8 @@ requires-python = ">=3.11"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# basetemp 放仓库内（`.tmp/` 已被 .gitignore 忽略），避免写系统临时目录；
+# 父目录由 tests/conftest.py 在导入时创建——pytest 9 创建 basetemp 时不带 parents=True。
 addopts = "-q --strict-markers --basetemp=.tmp/pytest"
 filterwarnings = [
     "ignore::DeprecationWarning",

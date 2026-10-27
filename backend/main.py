@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend.core import config, metrics
+from backend.core import clock, config, metrics
 from backend.core.errors import Ambiguous, YinshuError
 from backend.core.logging import get
 from backend.core.middleware import ApiKeyGate, BodyLimit, RateLimit, RequestContext
@@ -49,14 +49,29 @@ async def lifespan(_: FastAPI):
                     hint="生产环境建议设置 YINSHU_API_KEYS，或由网关统一鉴权")
 
     async def _sweeper():
+        last_anchor = 0.0
         while True:
-            await asyncio.sleep(300)
+            await asyncio.sleep(min(60, max(1, config.ANCHOR_INTERVAL)))
             try:
                 n = fsm.purge_expired()
                 if n:
                     log.info("session_purged", count=n)
+                m = audit.purge_pii_expired()
+                if m:
+                    log.info("pii_purged", count=m)
             except Exception:                                     # noqa: BLE001
                 log.exception("session_purge_failed")
+            # 链尾锚定：把 head 外发到 WORM/存证服务，才能发现"整表重写 + 本地重算"
+            if time.time() - last_anchor >= config.ANCHOR_INTERVAL:
+                try:
+                    r = audit.anchor_tail()
+                    if r.get("ok"):
+                        log.info("audit_anchored", seq=r["seq"], ext_ref=r["ext_ref"])
+                    else:
+                        log.warning("audit_anchor_skipped", reason=r.get("reason"))
+                except Exception:                                 # noqa: BLE001
+                    log.exception("audit_anchor_failed")
+                last_anchor = time.time()
 
     task = asyncio.create_task(_sweeper())
     try:
@@ -64,6 +79,7 @@ async def lifespan(_: FastAPI):
     finally:
         task.cancel()
         gateway.close()          # 优雅关掉下游连接池
+        audit.close()
         log.info("shutdown")
 
 
@@ -154,7 +170,7 @@ def _context(plan: Plan, slots: dict, out: executor.Outcome, stats: dict, inj: b
         payee_relation=payee.get("relation") or "",
         cross_border=("香港" in str(payee.get("city") or "")) or ("HSBC" in str(payee.get("bank") or "")),
         device_trusted=s.device_trusted,
-        hour=datetime.now().hour,
+        hour=clock.now().hour,
         velocity_1h=stats.get("velocity_1h", 0),
         daily_count=stats.get("daily_count", 0),
         segment=stats.get("segment", "普通"),
@@ -310,7 +326,7 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
     if d.tier in ("DENY", "HANDOFF"):
         fsm.reset(s)
         title = "已拒绝执行" if d.tier == "DENY" else "需人工复核"
-        ticket = f"TK{datetime.now().strftime('%m%d%H%M%S')}"
+        ticket = f"TK{clock.now().strftime('%m%d%H%M%S')}"
         return {"reply": ("这笔我不能替您办。" if d.tier == "DENY" else
                           f"这笔需要人工介入，工单号 {ticket}，客服会在 30 分钟内联系您。"),
                 "card": _notice("danger" if d.tier == "DENY" else "warn", title,

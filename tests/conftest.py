@@ -15,6 +15,12 @@ from pathlib import Path
 import pytest
 
 _TMP = Path(tempfile.mkdtemp(prefix="yinshu_test_"))
+
+# pyproject 里 addopts 指定了 --basetemp=.tmp/pytest；`.tmp/` 不进仓库，
+# 而 pytest 9 建 basetemp 时只做 mkdir(exist_ok=True)，父目录缺了就直接 FileNotFoundError。
+# 在 conftest 导入（早于 basetemp 解析）时把父目录备好。
+(Path(__file__).resolve().parents[1] / ".tmp").mkdir(parents=True, exist_ok=True)
+
 os.environ["YINSHU_DATA_DIR"] = str(_TMP)
 os.environ["YINSHU_ENV"] = "dev"
 os.environ["YINSHU_SESSION_BACKEND"] = "sqlite"
@@ -59,6 +65,23 @@ def bank_url():
     yield url
     server.should_exit = True
     t.join(timeout=5)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _frozen_clock():
+    """把权限引擎看到的时间钉在白天。
+
+    「凌晨 0-6 点」是 policy.json 的一个加分特征：真实时钟下同一句
+    「给我妈转500」在 00:05 会 +10 分越档变 CONFIRM，在 12:00 才是 AUTO。
+    不钉住时间，测试结果就取决于你几点跑——这不叫测试，叫抽奖。
+    """
+    from datetime import datetime
+
+    from backend.core import clock
+
+    clock.freeze(datetime(2026, 10, 27, 12, 0, 0))
+    yield
+    clock.unfreeze()
 
 
 @pytest.fixture(scope="session", autouse=True)

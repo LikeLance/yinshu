@@ -57,5 +57,29 @@ LLM_BASE = os.getenv("YINSHU_LLM_BASE", "https://api.deepseek.com/v1").rstrip("/
 LLM_MODEL = os.getenv("YINSHU_LLM_MODEL", "deepseek-chat")
 LLM_ENABLED = bool(LLM_API_KEY)
 
+# 身份：off=不校验（演示/测试，身份取 DEMO_USER_ID）/ optional=带 token 则校验 /
+# required=必须带 token。默认 off 是为了让现有演示与测试无需改动即可运行。
+AUTH_MODE = os.getenv("YINSHU_AUTH_MODE", "off").strip().lower()
+JWT_SECRET = os.getenv("YINSHU_JWT_SECRET", "yinshu-dev-secret-change-me").encode()
+JWT_TTL = int(os.getenv("YINSHU_JWT_TTL", str(30 * 60)))
+# demo 主体绑定的设备号（off 模式下所有请求共用一个，保证会话归属校验恒通过）
+DEMO_DEVICE = os.getenv("YINSHU_DEMO_DEVICE", "demo-device")
+
+# 审计链尾锚定：留空则用本地 audit_anchors 表（等价自签），
+# 生产应指向行内存证 / WORM 对象锁存储
+ANCHOR_URL = os.getenv("YINSHU_ANCHOR_URL", "").strip()
+ANCHOR_TOKEN = os.getenv("YINSHU_ANCHOR_TOKEN", "").strip()
+ANCHOR_KEY = os.getenv("YINSHU_ANCHOR_KEY", "yinshu-anchor-key-change-me")
+ANCHOR_INTERVAL = int(os.getenv("YINSHU_ANCHOR_INTERVAL", "60"))
+ANCHOR_EVERY_ROWS = int(os.getenv("YINSHU_ANCHOR_EVERY_ROWS", "200"))
+
+# debug 回吐：prod 默认关闭，避免把内部策略权重、工具名、收款人候选漏给前端
+DEBUG_ECHO = os.getenv("YINSHU_DEBUG_ECHO", "0" if IS_PROD else "1") == "1"
+
+# 服务端幂等：客户端可用 X-Idempotency-Key 显式指定；未指定时按
+# (uid, device, 请求体) 派生，保证"网络重试"不会变成"重复转账"
+IDEMPOTENCY_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_TTL", str(24 * 3600)))
+IDEMPOTENCY_INFLIGHT_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_INFLIGHT_TTL", "30"))
+
 DEMO_USER_ID = int(os.getenv("YINSHU_USER_ID", "1"))
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
