@@ -187,5 +187,4 @@ def build(intent: str, slots: dict) -> Plan:
                  label=f"锁定专项资金 {_amount(budget)} 元", on_fail="compensate"),
             Step(id="s2", tool="gift.recommend", args={"budget": _amount(budget)}, label="推荐礼物"),
         ])
-
     return _missing_plan(intent, [], s)

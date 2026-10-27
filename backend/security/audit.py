@@ -201,6 +201,11 @@ def append(trace_id: str, action: str, payload: dict, result: str = "ok",
     if not _initialized:
         init()
 
+    if principal is None:
+        from backend.core import reqctx
+
+        principal = reqctx.principal()
+
     uid = int(getattr(principal, "uid", 0) or 0)
     device = str(getattr(principal, "device_id", "") or "")
     ip = str(getattr(principal, "ip", "") or "")

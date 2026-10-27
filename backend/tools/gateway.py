@@ -114,7 +114,28 @@ def _raise_for(resp: httpx.Response) -> None:
     raise exc(f"{code}: {msg}", user_msg=msg or "银行系统处理失败")
 
 
-def call(name: str, args: dict, trace_id: str = "", step_id: str = "") -> dict:
+def _idem_key(name: str, step_id: str, principal: Any, idem_seed: str | None,
+              trace_id: str) -> str:
+    """确定性幂等键。
+
+    原实现是 `f"{trace_id}-{step_id}"`，而 trace_id 每个请求新生成 →
+    客户端重试就换了 key → 下游判重落空 → 重复转账。
+    seed 的优先级：显式 idem_seed（确认态用 confirm_id、AUTO 用请求级幂等键）
+    > 请求上下文里的 seed > trace_id（兜底）。
+    uid 与 tool 进 key，保证不同用户/不同动作不会撞。
+    """
+    from backend.core import reqctx
+
+    uid = int(getattr(principal, "uid", 0) or 0)
+    seed = idem_seed or reqctx.idem_seed() or trace_id or "t"
+    return f"yinshu:v2:{uid}:{name}:{seed}:{step_id or name}"
+
+
+def call(name: str, args: dict, trace_id: str = "", step_id: str = "",
+         principal: Any = None, idem_seed: str | None = None) -> dict:
+    from backend.core import reqctx
+
+    principal = principal if principal is not None else reqctx.principal()
     spec = registry.get(name)
     a = validate(spec, args)
     local = {k: a.pop(k) for k in spec.local if k in a}
@@ -127,7 +148,17 @@ def call(name: str, args: dict, trace_id: str = "", step_id: str = "") -> dict:
 
     headers: dict[str, str] = {}
     if spec.idem:
-        headers["Idempotency-Key"] = f"{trace_id or 't'}-{step_id or name}"
+        headers["Idempotency-Key"] = _idem_key(name, step_id, principal, idem_seed, trace_id)
+    # 主体透传：真实银行侧要据此做账户/权限校验，不能只靠我们这边自说自话
+    if principal is not None:
+        if getattr(principal, "uid", 0):
+            headers["X-User-Id"] = str(principal.uid)
+        if getattr(principal, "device_id", ""):
+            headers["X-Device-Id"] = principal.device_id
+        if getattr(principal, "channel", ""):
+            headers["X-Channel"] = principal.channel
+    if trace_id:
+        headers["X-Trace-Id"] = trace_id
 
     last_err: Exception | None = None
     for attempt in range(MAX_RETRY + 1):

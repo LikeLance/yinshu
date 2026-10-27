@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -19,10 +21,10 @@ from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from backend.core import clock, config, metrics
+from backend.core import clock, config, idempotency as idem, metrics, reqctx
 from backend.core.errors import Ambiguous, YinshuError
 from backend.core.logging import get
 from backend.core.middleware import ApiKeyGate, BodyLimit, RateLimit, RequestContext
@@ -31,7 +33,7 @@ from backend.nlu.slots import parse_amount, parse_people, parse_payee, parse_whe
 from backend.planner import executor, planner
 from backend.planner.contracts import Plan, Step
 from backend.presenter import build as build_presentation, plan_card
-from backend.security import audit, guard, injection, policy
+from backend.security import audit, guard, identity, injection, policy
 from backend.session import fsm
 from backend.tools import gateway, registry
 
@@ -93,16 +95,21 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 中间件：先打请求上下文，再限流，再校验体积（顺序见 middleware.py 注释）
+# 中间件执行顺序（外 → 内）。Starlette 的 add_middleware 是"后加者在外"，
+# 所以这里的书写顺序是内 → 外，实际执行为：
+#   CORS → RequestContext → RateLimit → ApiKeyGate → BodyLimit → 路由
+# 限流必须在鉴权之外：否则未授权请求在 ApiKeyGate 就被 401 掉，
+# 永远消耗不到令牌桶，401 可以被无限刷。
 app.add_middleware(BodyLimit)
-app.add_middleware(RateLimit)
 app.add_middleware(ApiKeyGate)
+app.add_middleware(RateLimit)
 app.add_middleware(RequestContext)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=config.CORS_ORIGINS,
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "X-Request-Id"],
+    allow_headers=["Content-Type", "X-Request-Id", "X-Idempotency-Key",
+                   "X-Device-Id", "Authorization"],
     max_age=600,
 )
 
@@ -114,9 +121,21 @@ CUSTOMER_ORDER = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}
 
 
 class ChatReq(BaseModel):
+    """对话请求体。
+
+    `extra="forbid"`：身份只能来自 Authorization 头。请求体里出现 user_id / uid
+    这类字段直接 422——"身份由调用方自述"是这个项目最危险的一个默认。
+
+    `device_trusted` 保留是为了不破坏既有前端，但**服务端不再采信**：
+    设备是否可信由 `identity.device_trusted()` 按历史行为判定。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
     session_id: str | None = Field(default=None, max_length=64)
     text: str = Field(default="", max_length=config.MAX_TEXT_LEN)
-    device_trusted: bool = True
+    device_trusted: bool = Field(default=True, deprecated=True,
+                                 description="已忽略；设备信任由服务端判定")
 
 
 def _jsonable(o: Any) -> Any:
@@ -445,13 +464,83 @@ def _merge_clarify(s: fsm.Session, text: str) -> tuple[str, dict]:
     return st.get("intent") or "unknown", slots
 
 
+def _client_ip(request: Request) -> str:
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def _executed(resp: JSONResponse) -> bool:
+    """这次请求是否真的改变了世界（拿到了回执卡）。
+
+    只读问答、以及"还需要再点一次确认"都**不算**——否则第二次「确认」
+    会被当成重放直接回放"请再确认一次"，用户永远落不了地。
+    """
+    try:
+        body = json.loads(bytes(resp.body))
+        return (body.get("card") or {}).get("type") == "receipt"
+    except Exception:                                          # noqa: BLE001
+        return False
+
+
 @api.post("/chat")
-def chat(req: ChatReq):
+def chat(request: Request, req: ChatReq):
     t0 = time.time()
-    trace = uuid.uuid4().hex[:16]
-    s = fsm.get(req.session_id)
-    # 设备信任是"这次请求携带的信号"，只用于本次决策打分；不落盘，避免旧值污染后续判断
-    s.device_trusted = req.device_trusted
+    p = identity.principal_from_headers(request.headers, _client_ip(request))
+    trace = request.headers.get("x-request-id") or uuid.uuid4().hex[:16]
+
+    # 幂等键只由"业务请求"决定，与本次网络会话无关：
+    # 客户端可用 X-Idempotency-Key 显式指定；不给则按 (uid, device, 请求体) 派生。
+    body = json.dumps(req.model_dump(exclude={"device_trusted"}), ensure_ascii=False,
+                      sort_keys=True, default=str).encode()
+    req_hash = hashlib.sha256(body).hexdigest()
+    explicit = (request.headers.get("x-idempotency-key") or "").strip()
+    key = explicit or idem.derive_key(p.uid, p.device_id, body)
+    ttl = config.IDEMPOTENCY_TTL if explicit else config.IDEMPOTENCY_AUTO_TTL
+
+    slot = idem.begin(p.uid, "chat", key, req_hash, ttl=ttl)
+    if slot.state == "replay":
+        return JSONResponse(idem.replay_payload(slot), status_code=slot.http_status or 200,
+                            headers={"x-idempotent-replay": "true"})
+    if slot.state == "inflight":
+        return JSONResponse({"ok": False, "error": {
+            "code": "IN_PROGRESS", "message": "这笔正在处理，请勿重复提交"}},
+            status_code=409, headers={"Retry-After": "1"})
+    if slot.state == "conflict":
+        return JSONResponse({"ok": False, "error": {
+            "code": "IDEMPOTENCY_KEY_REUSED", "message": "同一幂等键对应了不同请求"}},
+            status_code=422)
+
+    token = reqctx.begin(p, trace, key)
+    try:
+        resp = _chat_inner(request, req, p, trace, t0)
+        done = _executed(resp)
+        try:
+            if done:
+                idem.finish(p.uid, "chat", key, resp.status_code, bytes(resp.body))
+            else:
+                idem.fail(p.uid, "chat", key)     # 没落地：允许同一个 key 再试
+            identity.touch_device(p.uid, p.device_id, success=done)
+        except Exception:                                     # noqa: BLE001
+            # 幂等/设备画像写失败不能把已经成功的业务操作变成 5xx
+            log.warning("idem_record_failed", request_id=trace)
+        return resp
+    except Exception:
+        try:
+            idem.fail(p.uid, "chat", key)
+        except Exception:                                     # noqa: BLE001
+            pass
+        raise
+    finally:
+        reqctx.reset(token)
+
+
+def _chat_inner(request: Request, req: ChatReq, p: identity.Principal, trace: str,
+                t0: float):
+    s = fsm.get(req.session_id, p)
+    # 设备信任由服务端按 (uid, device_id) 历史判定，不再采信客户端自述
+    s.device_trusted = identity.device_trusted(p.uid, p.device_id)
     text = (req.text or "").strip()
 
     scan = injection.scan(text)
@@ -635,6 +724,8 @@ def health():
         bank = {"ok": False}
     return {"ok": True, "bank": bank, "audit": audit.stats(),
             "llm": "rule-engine (deterministic)", "policy": policy.config()["tiers"],
+            "auth_mode": config.AUTH_MODE, "debug_echo": config.DEBUG_ECHO,
+            "anchor": audit.get_anchor().name,
             "version": config.APP_VERSION, "env": config.ENV}
 
 
@@ -649,8 +740,9 @@ def get_tools():
 
 
 @api.get("/audit/verify")
-def audit_verify():
-    return audit.verify()
+def audit_verify(full: bool = False):
+    """校验审计链。默认从最近检查点起做增量校验；`?full=true` 强制从头。"""
+    return audit.verify(full=full)
 
 
 @api.get("/audit/{trace_id}")
@@ -709,7 +801,8 @@ def _err(code: str, message: str, status: int, request: Request, extra: dict | N
 @app.exception_handler(YinshuError)
 async def _on_yinshu_error(request: Request, exc: YinshuError):
     status = 400
-    if exc.code in ("POLICY_DENY", "INJECTION_BLOCKED"):
+    if exc.code in ("POLICY_DENY", "INJECTION_BLOCKED", "SESSION_OWNER_MISMATCH",
+                    "UNAUTHORIZED", "IDENTITY_IN_BODY"):
         status = 403
     elif exc.code in ("LIMIT_EXCEEDED", "INSUFFICIENT_FUNDS"):
         status = 409

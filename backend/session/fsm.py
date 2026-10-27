@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.core import config
+from backend.core.errors import YinshuError
 from backend.session import store as store_mod
 
 TTL = config.SESSION_TTL
@@ -37,6 +38,10 @@ class Session:
     history: list[dict] = field(default_factory=list)
     updated: float = field(default_factory=time.time)
     device_trusted: bool = True
+    # 会话归属：sid 不再是唯一凭证，跨主体访问直接拒绝
+    owner_uid: int = 0
+    owner_device: str = ""
+    ver: int = 0                     # 乐观锁版本号，用于确认态抢占
 
     def expire_pending(self) -> bool:
         ts = self.stash.get("created_at")
@@ -48,31 +53,51 @@ class Session:
         return False
 
 
+class OwnerMismatch(YinshuError):
+    code = "SESSION_OWNER_MISMATCH"
+    user_msg = "这个会话不属于当前用户，请重新发起。"
+
+
 def _persist(s: Session) -> None:
     # 只读往返（账单/查询）不产生任何待还原状态，没必要每轮都落盘
     if s.state == "IDLE" and not s.stash:
         return
-    STORE.save(s.sid, s.state, s.stash, s.history, s.device_trusted)
+    STORE.save(s.sid, s.state, s.stash, s.history, s.device_trusted,
+               owner_uid=s.owner_uid, owner_device=s.owner_device, ver=s.ver)
 
 
-def get(sid: str | None) -> Session:
-    """取会话：内存命中就直接用；否则从存储还原；都没有就新建。"""
+def _bind(s: Session, principal: Any) -> Session:
+    """把会话绑到主体。旧库（owner_uid=0）首次访问时接管，之后不可换人。"""
+    uid = int(getattr(principal, "uid", 0) or 0)
+    device = str(getattr(principal, "device_id", "") or "")
+    if s.owner_uid == 0:
+        s.owner_uid, s.owner_device = uid, device
+    elif s.owner_uid != uid:
+        raise OwnerMismatch(f"sid={s.sid} owner={s.owner_uid} caller={uid}")
+    return s
+
+
+def get(sid: str | None, principal: Any = None) -> Session:
+    """取会话：存储命中则还原；否则新建。跨主体访问抛 OwnerMismatch。"""
+    from backend.security.identity import Principal
+
+    p = principal or Principal.demo()
     now = time.time()
     if not sid:
         sid = uuid.uuid4().hex[:12]
-        s = Session(sid=sid)
+        s = _bind(Session(sid=sid), p)
         _persist(s)
         return s
 
     rec = STORE.load(sid)
     if rec is None:
-        s = Session(sid=sid)
+        s = _bind(Session(sid=sid), p)
         _persist(s)
         return s
 
     if now - float(rec.get("updated") or 0) > TTL:
         STORE.delete(sid)
-        s = Session(sid=sid)
+        s = _bind(Session(sid=sid), p)
         _persist(s)
         return s
 
@@ -80,8 +105,30 @@ def get(sid: str | None) -> Session:
                 stash=store_mod.decode_stash(rec.get("stash") or ""),
                 history=_load_json(rec.get("history")),
                 updated=float(rec.get("updated") or now),
-                device_trusted=bool(rec.get("device_trusted", True)))
-    return s
+                device_trusted=bool(rec.get("device_trusted", True)),
+                owner_uid=int(rec.get("owner_uid") or 0),
+                owner_device=rec.get("owner_device") or "",
+                ver=int(rec.get("ver") or 0))
+    return _bind(s, p)
+
+
+def claim(s: Session, principal: Any, new_stash: dict) -> bool:
+    """确认态抢占（跨进程 CAS）：只有抢到的一方才能真正执行这笔。
+
+    用户连点两次确认 / 两个 worker 同时收到确认时，第二次返回 False。
+    """
+    uid = int(getattr(principal, "uid", 0) or 0)
+    ok = STORE.claim(s.sid, s.ver, uid, new_stash)
+    if ok:
+        s.state = "EXECUTING"
+        s.ver += 1
+        s.stash = new_stash
+    return ok
+
+
+def finish(s: Session, state: str = "EXECUTED") -> None:
+    s.state = state
+    STORE.finish(s.sid, state)
 
 
 def _load_json(raw: Any) -> list:

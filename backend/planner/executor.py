@@ -16,8 +16,27 @@ from backend.core.errors import Ambiguous, YinshuError
 from backend.planner.contracts import Plan, Step
 from backend.tools import gateway
 
+def _hold_args(out: "Outcome", plan: "Plan") -> dict | None:
+    """找出本计划里锁定资金的 hold，用于失败时释放。
+
+    生日这类跨场景 DAG 是「先锁预算，再下单」；下单失败如果不释放，
+    那笔钱就永久挂在 holds 表里——原实现只有 hold.create 一个补偿器，
+    gift.order 失败后锁定的预算再也没人解。
+
+    hold_id 可能在本次结果里，也可能是上一阶段（选礼物前）锁好后带到 slots 的。
+    """
+    for r in out.results.values():
+        if isinstance(r, dict) and r.get("hold_id"):
+            return {"hold_id": r["hold_id"]}
+    hid = (plan.slots or {}).get("hold_id")
+    return {"hold_id": hid} if hid else None
+
+
+# 补偿器签名：(outcome, step_id, plan) -> 调用参数 | None
 COMPENSATORS: dict[str, tuple[str, Any]] = {
-    "hold.create": ("hold.release", lambda r: {"hold_id": r["hold_id"]}),
+    "hold.create": ("hold.release",
+                    lambda out, sid, plan: {"hold_id": out.results[sid]["hold_id"]}),
+    "gift.order": ("hold.release", lambda out, sid, plan: _hold_args(out, plan)),
 }
 
 
@@ -53,7 +72,7 @@ def _check_ambiguous(name: str, data: dict) -> None:
     raise Ambiguous(kind, opts)
 
 
-def _compensate(out: Outcome, plan: Plan, trace_id: str) -> None:
+def _compensate(out: Outcome, plan: Plan, trace_id: str, principal: Any = None) -> None:
     for sid in reversed(out.executed):
         step = next((s for s in plan.steps if s.id == sid), None)
         if not step or step.on_fail != "compensate":
@@ -63,21 +82,25 @@ def _compensate(out: Outcome, plan: Plan, trace_id: str) -> None:
             continue
         tool, mapper = pair
         try:
-            gateway.call(tool, mapper(out.results[sid]), trace_id, f"{sid}-comp")
+            args = mapper(out, sid, plan)
+            if not args:
+                continue
+            gateway.call(tool, args, trace_id, f"{sid}-comp", principal=principal)
             out.compensated.append(sid)
         except YinshuError as e:
             out.errors.append(f"补偿失败 {tool}: {e.code}")
 
 
 def run(plan: Plan, phase: str = "preview", trace_id: str = "", state: Outcome | None = None,
-        ignore_ambiguous: bool = False) -> Outcome:
+        ignore_ambiguous: bool = False, principal: Any = None,
+        idem_seed: str | None = None) -> Outcome:
     out = state or Outcome()
     if phase == "preview":
         for step in plan.steps:
             if step.is_gated:
                 out.pending = [s.id for s in plan.steps if s.id not in out.results]
                 return out
-            _exec(plan, step, out, trace_id, ignore_ambiguous)
+            _exec(plan, step, out, trace_id, ignore_ambiguous, principal, idem_seed)
         out.pending = []
         return out
 
@@ -85,20 +108,23 @@ def run(plan: Plan, phase: str = "preview", trace_id: str = "", state: Outcome |
         if step.id in out.results:
             continue
         try:
-            _exec(plan, step, out, trace_id, ignore_ambiguous)
+            _exec(plan, step, out, trace_id, ignore_ambiguous, principal, idem_seed)
         except YinshuError as e:
             out.errors.append(f"{step.id}:{getattr(e, 'code', 'ERR')}")
             if step.on_fail == "abort":
-                _compensate(out, plan, trace_id)
+                _compensate(out, plan, trace_id, principal)
                 raise
     out.pending = [s.id for s in plan.steps if s.id not in out.results and s.is_gated]
     return out
 
 
-def _exec(plan: Plan, step: Step, out: Outcome, trace_id: str, ignore_ambiguous: bool = False) -> None:
+def _exec(plan: Plan, step: Step, out: Outcome, trace_id: str,
+          ignore_ambiguous: bool = False, principal: Any = None,
+          idem_seed: str | None = None) -> None:
     args = resolve(step.args, plan.slots, out.results)
     args = {k: v for k, v in args.items() if v is not None}
-    data = gateway.call(step.tool, args, trace_id, step.id)
+    data = gateway.call(step.tool, args, trace_id, step.id,
+                        principal=principal, idem_seed=idem_seed)
     out.results[step.id] = data
     out.executed.append(step.id)
     if not ignore_ambiguous:

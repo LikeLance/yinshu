@@ -108,7 +108,10 @@ def decode_stash(raw: str) -> dict[str, Any]:
 
 class Store(Protocol):
     def load(self, sid: str) -> dict[str, Any] | None: ...
-    def save(self, sid: str, state: str, stash: dict, history: list, device_trusted: bool) -> None: ...
+    def save(self, sid: str, state: str, stash: dict, history: list, device_trusted: bool,
+             owner_uid: int = 0, owner_device: str = "", ver: int = 0) -> None: ...
+    def claim(self, sid: str, ver: int, uid: int, new_stash: dict) -> bool: ...
+    def finish(self, sid: str, state: str) -> None: ...
     def delete(self, sid: str) -> None: ...
     def purge(self, ttl: int) -> int: ...
     def count(self) -> int: ...
@@ -124,11 +127,29 @@ class MemoryStore:
             rec = self._d.get(sid)
             return dict(rec) if rec else None
 
-    def save(self, sid: str, state: str, stash: dict, history: list, device_trusted: bool) -> None:
+    def save(self, sid: str, state: str, stash: dict, history: list, device_trusted: bool,
+             owner_uid: int = 0, owner_device: str = "", ver: int = 0) -> None:
         with self._lock:
             self._d[sid] = {"state": state, "stash": encode_stash(stash),
                             "history": json.dumps(history, ensure_ascii=False),
-                            "device_trusted": int(device_trusted), "updated": time.time()}
+                            "device_trusted": int(device_trusted), "updated": time.time(),
+                            "owner_uid": owner_uid, "owner_device": owner_device, "ver": ver}
+
+    def claim(self, sid: str, ver: int, uid: int, new_stash: dict) -> bool:
+        with self._lock:
+            rec = self._d.get(sid)
+            if not rec or rec["state"] != "AWAIT_CONFIRM" or rec["ver"] != ver \
+                    or rec["owner_uid"] != uid:
+                return False
+            rec.update(state="EXECUTING", stash=encode_stash(new_stash),
+                       ver=ver + 1, updated=time.time())
+            return True
+
+    def finish(self, sid: str, state: str) -> None:
+        with self._lock:
+            rec = self._d.get(sid)
+            if rec:
+                rec.update(state=state, updated=time.time())
 
     def delete(self, sid: str) -> None:
         with self._lock:
@@ -165,28 +186,72 @@ class SqliteStore:
                    device_trusted INTEGER NOT NULL DEFAULT 1,
                    updated REAL NOT NULL)""")
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated)")
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """加列式迁移：owner/ver 是后加的，旧库不重建。
+
+        owner_uid/owner_device 让"会话"不再是唯一凭证；ver 用来做跨进程 CAS，
+        挡住"用户连点两次确认"导致同一笔被扣两次。
+        """
+        have = {r["name"] for r in self._conn.execute("PRAGMA table_info(sessions)")}
+        for name, ddl in (
+            ("owner_uid", "INTEGER NOT NULL DEFAULT 0"),
+            ("owner_device", "TEXT NOT NULL DEFAULT ''"),
+            ("ver", "INTEGER NOT NULL DEFAULT 0"),
+            ("confirm_id", "TEXT"),
+        ):
+            if name not in have:
+                self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {name} {ddl}")
 
     def load(self, sid: str) -> dict[str, Any] | None:
         with self._lock:
             r = self._conn.execute(
-                "SELECT state, stash, history, device_trusted, updated FROM sessions WHERE sid=?",
+                "SELECT state, stash, history, device_trusted, updated, owner_uid,"
+                " owner_device, ver, confirm_id FROM sessions WHERE sid=?",
                 (sid,)).fetchone()
         if not r:
             return None
         return {"state": r["state"], "stash": r["stash"], "history": r["history"],
-                "device_trusted": bool(r["device_trusted"]), "updated": r["updated"]}
+                "device_trusted": bool(r["device_trusted"]), "updated": r["updated"],
+                "owner_uid": r["owner_uid"], "owner_device": r["owner_device"],
+                "ver": r["ver"], "confirm_id": r["confirm_id"]}
 
-    def save(self, sid: str, state: str, stash: dict, history: list, device_trusted: bool) -> None:
+    def save(self, sid: str, state: str, stash: dict, history: list, device_trusted: bool,
+             owner_uid: int = 0, owner_device: str = "", ver: int = 0) -> None:
         with self._lock:
             self._conn.execute(
-                """INSERT INTO sessions(sid, state, stash, history, device_trusted, updated)
-                   VALUES(?,?,?,?,?,?)
+                """INSERT INTO sessions(sid, state, stash, history, device_trusted, updated,
+                                        owner_uid, owner_device, ver)
+                   VALUES(?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(sid) DO UPDATE SET
                      state=excluded.state, stash=excluded.stash, history=excluded.history,
-                     device_trusted=excluded.device_trusted, updated=excluded.updated""",
+                     device_trusted=excluded.device_trusted, updated=excluded.updated,
+                     owner_uid=excluded.owner_uid, owner_device=excluded.owner_device,
+                     ver=excluded.ver""",
                 (sid, state, encode_stash(stash), json.dumps(history, ensure_ascii=False),
-                 int(device_trusted), time.time()))
+                 int(device_trusted), time.time(), owner_uid, owner_device, ver))
+            self._conn.commit()
+
+    def claim(self, sid: str, ver: int, uid: int, new_stash: dict) -> bool:
+        """跨进程 CAS：把 AWAIT_CONFIRM 原子地翻成 EXECUTING。
+
+        `threading.Lock` 跨进程无效，`SELECT ... FOR UPDATE` SQLite 也没有，
+        所以用 `UPDATE ... WHERE ver=? AND state=?` 的 rowcount 做抢占。
+        """
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE sessions SET state='EXECUTING', ver=ver+1, stash=?, updated=?"
+                " WHERE sid=? AND ver=? AND state='AWAIT_CONFIRM' AND owner_uid=?",
+                (encode_stash(new_stash), time.time(), sid, ver, uid))
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def finish(self, sid: str, state: str) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE sessions SET state=?, updated=? WHERE sid=?",
+                               (state, time.time(), sid))
             self._conn.commit()
 
     def delete(self, sid: str) -> None:

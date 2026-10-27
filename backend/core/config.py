@@ -79,6 +79,7 @@ DEBUG_ECHO = os.getenv("YINSHU_DEBUG_ECHO", "0" if IS_PROD else "1") == "1"
 # 服务端幂等：客户端可用 X-Idempotency-Key 显式指定；未指定时按
 # (uid, device, 请求体) 派生，保证"网络重试"不会变成"重复转账"
 IDEMPOTENCY_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_TTL", str(24 * 3600)))
+IDEMPOTENCY_AUTO_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_AUTO_TTL", "600"))
 IDEMPOTENCY_INFLIGHT_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_INFLIGHT_TTL", "30"))
 
 DEMO_USER_ID = int(os.getenv("YINSHU_USER_ID", "1"))

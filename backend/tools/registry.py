@@ -101,10 +101,10 @@ _reg(ToolSpec("transfer.collect", "POST", "/v1/transfers/collect",
               action="transfer.collect", money=False, idem=True, desc="AA 收款"))
 _reg(ToolSpec("hold.create", "POST", "/v1/holds",
               {"amount": str, "reason": str, "expire_at": str}, ("amount",), {},
-              action="hold.create", reversible=True, desc="锁定专项资金"))
+              action="hold.create", reversible=True, idem=True, desc="锁定专项资金"))
 _reg(ToolSpec("hold.release", "POST", "/v1/holds/{hold_id}/release",
               {"hold_id": int}, ("hold_id",), {},
-              action="hold.create", reversible=True, desc="释放锁定资金"))
+              action="hold.create", reversible=True, idem=True, desc="释放锁定资金"))
 
 MONEY_ACTIONS = {n for n, s in TOOLS.items() if s.money}
 

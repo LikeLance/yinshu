@@ -124,7 +124,8 @@ CREATE TABLE IF NOT EXISTS holds (
     reason TEXT,
     status TEXT NOT NULL DEFAULT 'held',       -- held / released / settled
     expire_at TEXT,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    idem_key TEXT                              -- 幂等键：重复提交返回首次结果
 );
 
 CREATE TABLE IF NOT EXISTS gift_orders (
@@ -145,12 +146,24 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     # 读写混合 + 高频转账：WAL 让读不阻塞写，NORMAL 去掉每次提交的 fsync
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """加列式迁移：已有 bank.db 不必 --reset 也能用上新列。"""
+    have = {r["name"] for r in conn.execute("PRAGMA table_info(holds)")}
+    if "idem_key" not in have:
+        conn.execute("ALTER TABLE holds ADD COLUMN idem_key TEXT")
+    # 幂等键唯一（部分索引：NULL 不参与唯一性，历史行不受影响）
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_holds_idem ON holds(idem_key)"
+                 " WHERE idem_key IS NOT NULL")
 
 
 # ---------- 金额工具 ----------

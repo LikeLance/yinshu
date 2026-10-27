@@ -342,9 +342,17 @@ async function send(text) {
   addMsg('me', esc(text));
   const t = addMsg('agent', '<div class="typing"><i></i><i></i><i></i></div>');
   try {
+    // 设备号只是一个"我换了台机器"的标识；可信与否由服务端按历史判定，
+    // 客户端不再自报 device_trusted（那等于让攻击者自己给自己加分）。
+    let deviceId = localStorage.getItem('ys_did');
+    if (!deviceId) {
+      deviceId = 'web-' + Math.random().toString(36).slice(2, 10);
+      localStorage.setItem('ys_did', deviceId);
+    }
     const r = await fetch('/api/chat', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, text, device_trusted: true })
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Device-Id': deviceId },
+      body: JSON.stringify({ session_id: sessionId, text })
     });
     const d = await r.json();
     sessionId = d.session_id;

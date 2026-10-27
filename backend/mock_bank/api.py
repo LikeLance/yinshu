@@ -602,17 +602,31 @@ def risk_stats(user_id: int = 1):
 # ---------------- 资金锁定 / 三方 ----------------
 
 @app.post("/v1/holds")
-def create_hold(payload: dict = Body(...)):
-    cur = _conn.execute("INSERT INTO holds(user_id,amount,reason,status,expire_at,created_at) VALUES(1,?,?,?,?,?)",
-                        (mq(D(payload["amount"])), payload.get("reason", "跨场景资金锁定"),
-                         "held", payload.get("expire_at"), _now()))
+def create_hold(payload: dict = Body(...), idempotency_key: str | None = Header(default=None)):
+    """锁定资金。与转账一样必须带幂等键——锁资金也是"改世界"的操作。
+
+    原实现不收幂等头，而网关侧 hold.create 又没标 idem，两边都漏：
+    网络超时重试一次就多锁一笔，用户看到可用余额莫名少了两倍预算。
+    """
+    if not idempotency_key:
+        raise HTTPException(400, {"code": "IDEMPOTENCY_REQUIRED",
+                                  "message": "写操作必须携带 Idempotency-Key"})
+    hit = _conn.execute("SELECT * FROM holds WHERE idem_key=?", (idempotency_key,)).fetchone()
+    if hit:
+        return {"hold_id": hit["id"], "amount": hit["amount"], "status": hit["status"],
+                "expire_at": hit["expire_at"], "idempotent_replay": True}
+    cur = _conn.execute(
+        "INSERT INTO holds(user_id,amount,reason,status,expire_at,created_at,idem_key)"
+        " VALUES(1,?,?,?,?,?,?)",
+        (mq(D(payload["amount"])), payload.get("reason", "跨场景资金锁定"),
+         "held", payload.get("expire_at"), _now(), idempotency_key))
     _conn.commit()
     return {"hold_id": cur.lastrowid, "amount": mq(D(payload["amount"])), "status": "held",
-            "expire_at": payload.get("expire_at")}
+            "expire_at": payload.get("expire_at"), "idempotent_replay": False}
 
 
 @app.post("/v1/holds/{hold_id}/release")
-def release_hold(hold_id: int):
+def release_hold(hold_id: int, idempotency_key: str | None = Header(default=None)):
     _conn.execute("UPDATE holds SET status='released' WHERE id=?", (hold_id,))
     _conn.commit()
     r = _conn.execute("SELECT * FROM holds WHERE id=?", (hold_id,)).fetchone()
