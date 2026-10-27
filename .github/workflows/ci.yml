@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: 安装依赖
+        run: |
+          python -m pip install -U pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: 单元测试 + 接口契约（自带进程内银行，不依赖外部服务）
+        run: python -m pytest --cov=backend --cov-report=term-missing --cov-fail-under=70
+
+      - name: 造数
+        run: python -m backend.mock_bank.seed --reset
+
+      - name: 起 Mock 核心系统与后端
+        run: |
+          python -m uvicorn backend.mock_bank.api:app --host 127.0.0.1 --port 8010 --log-level warning &
+          python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --log-level warning &
+          for i in $(seq 1 40); do
+            if curl -s --noproxy '*' http://127.0.0.1:8000/readyz > /dev/null; then
+              echo "服务就绪"; break
+            fi
+            sleep 1
+          done
+
+      - name: 端到端剧本（13 场）
+        run: python demo.py --reset
+
+      - name: 评测报告
+        run: |
+          python -m tests.run_eval
+          grep -E "意图识别|槽位|注入识别|权限矩阵|端到端" docs/04-评测报告.md | head -8
+
+      - name: 审计链校验
+        run: |
+          python - <<'PY'
+          import json, urllib.request
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          d = json.load(opener.open("http://127.0.0.1:8000/api/audit/verify"))
+          print(d)
+          assert d["ok"] is True, "审计链断链"
+          PY
+
+      - name: 上传评测报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: docs/04-评测报告.md
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建镜像（验证 Dockerfile 可用）
+        run: docker build -t yinshu:ci .

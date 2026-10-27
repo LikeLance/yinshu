@@ -1,0 +1,22 @@
+# 数据与运行时（不进仓库）
+data/
+.tmp/
+*.db
+*.db-wal
+*.db-shm
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

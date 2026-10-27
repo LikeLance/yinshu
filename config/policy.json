@@ -1,0 +1,44 @@
+{
+  "_comment": "银枢权限策略配置。银行可按自身风险偏好调整阈值与权重，无需改代码。",
+  "tiers": {
+    "auto_max": 29,
+    "confirm_max": 69
+  },
+  "weights": {
+    "transfer.create": 20,
+    "transfer.schedule": 18,
+    "transfer.collect": 15,
+    "wealth.order": 35,
+    "wealth.redeem": 22,
+    "card.apply": 10,
+    "card.limit": 15,
+    "card.freeze": 12,
+    "card.loss": 60,
+    "sub.cancel": 32,
+    "gift.order": 30,
+    "hold.create": 5
+  },
+  "features": {
+    "payee_not_whitelisted": 12,
+    "payee_new": 10,
+    "amount_gt_5000": 15,
+    "amount_gt_20000": 20,
+    "device_untrusted": 15,
+    "hour_night": 10,
+    "velocity_1h_ge_5": 12,
+    "segment_elderly": 10,
+    "wealth_amount_gt_10000": 20
+  },
+  "hard_rules": {
+    "deny": [
+      {"when": "payee_blacklisted", "reason": "收款人命中反诈黑名单"},
+      {"when": "wealth_unsuitable", "reason": "产品风险等级高于您的风险承受能力（适当性管理）"}
+    ],
+    "handoff": [
+      {"when": "amount_gt_50000", "reason": "单笔金额超过 5 万元，需人工复核"},
+      {"when": "payee_cross_border", "reason": "跨境收款需人工审核"}
+    ],
+    "double_confirm": ["card.loss"]
+  },
+  "injection_downgrade": true
+}

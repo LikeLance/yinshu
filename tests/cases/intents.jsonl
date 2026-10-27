@@ -1,0 +1,50 @@
+{"text": "给我妈转500，备注生活费", "intent": "transfer.create", "amount": "500", "payee": "妈"}
+{"text": "帮我给李慧转2000", "intent": "transfer.create", "amount": "2000", "payee": "李慧"}
+{"text": "转500给妈", "intent": "transfer.create", "amount": "500", "payee": "妈"}
+{"text": "给我妈转五百块", "intent": "transfer.create", "amount": "500"}
+{"text": "给我爸转一千二，备注过节", "intent": "transfer.create", "amount": "1200"}
+{"text": "我要转账", "intent": "transfer.create"}
+{"text": "下周一给王强转2500", "intent": "transfer.schedule", "amount": "2500"}
+{"text": "每月1号给房东转2500", "intent": "transfer.schedule", "amount": "2500"}
+{"text": "每周五给爸转300", "intent": "transfer.schedule", "amount": "300"}
+{"text": "明天下午3点给李慧转2000", "intent": "transfer.schedule", "amount": "2000"}
+{"text": "这顿380我们4个人AA", "intent": "transfer.collect", "amount": "380", "people": 4}
+{"text": "帮我AA一下，总共600元，6个人", "intent": "transfer.collect", "amount": "600", "people": 6}
+{"text": "这个月我钱都花哪了", "intent": "bill.summary"}
+{"text": "上个月的账单给我看看", "intent": "bill.summary"}
+{"text": "近半年消费情况", "intent": "bill.summary"}
+{"text": "生成本年度账单报告", "intent": "bill.summary"}
+{"text": "有没有可疑的交易", "intent": "bill.anomaly"}
+{"text": "最近有没有乱扣费", "intent": "bill.anomaly"}
+{"text": "这几个月有没有盗刷", "intent": "bill.anomaly"}
+{"text": "有什么稳健的理财推荐", "intent": "wealth.compare"}
+{"text": "看看理财产品", "intent": "wealth.compare"}
+{"text": "我这点钱能投什么", "intent": "wealth.compare"}
+{"text": "买2000块中证红利", "intent": "wealth.subscribe", "amount": "2000", "keyword": "中证红利"}
+{"text": "申购1000元安心债基", "intent": "wealth.subscribe", "amount": "1000", "keyword": "安心债基"}
+{"text": "我想买点理财", "intent": "wealth.subscribe"}
+{"text": "赎回我的安心债基", "intent": "wealth.redeem", "keyword": "安心债基"}
+{"text": "把月月盈取出来", "intent": "wealth.redeem"}
+{"text": "我想赎回", "intent": "wealth.redeem"}
+{"text": "帮我把信用卡挂失", "intent": "card.loss"}
+{"text": "卡丢了，挂失一下", "intent": "card.loss"}
+{"text": "调低我的卡限额到5000", "intent": "card.limit", "amount": "5000"}
+{"text": "把尾号6621的日限额调到2万", "intent": "card.limit", "amount": "20000"}
+{"text": "把我的卡冻结", "intent": "card.freeze"}
+{"text": "解冻我的卡", "intent": "card.freeze"}
+{"text": "申请一张信用卡", "intent": "card.apply"}
+{"text": "我几张卡", "intent": "card.list"}
+{"text": "看看我尾号6621的卡", "intent": "card.list"}
+{"text": "有哪些自动续费", "intent": "sub.list"}
+{"text": "帮我看看订阅扣款", "intent": "sub.list"}
+{"text": "取消腾讯视频订阅", "intent": "sub.cancel", "keyword": "腾讯视频"}
+{"text": "退订网易云音乐黑胶", "intent": "sub.cancel"}
+{"text": "关掉健身房的自动续费", "intent": "sub.cancel"}
+{"text": "下周三我妈生日，帮我准备一下", "intent": "cross.birthday"}
+{"text": "我妈生日快到了，帮我订个花", "intent": "cross.birthday"}
+{"text": "我余额还有多少", "intent": "balance.query"}
+{"text": "查查我账户里还剩多少钱", "intent": "balance.query"}
+{"text": "我卡里有多少钱", "intent": "balance.query"}
+{"text": "今天天气怎么样", "intent": "unknown"}
+{"text": "你好", "intent": "unknown"}
+{"text": "讲个笑话", "intent": "unknown"}

@@ -1,0 +1,24 @@
+[project]
+name = "yinshu"
+version = "1.0.0"
+description = "银枢 YinShu · 可信银行智能体（安全策略下沉到执行层）"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --basetemp=.tmp/pytest"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]
+
+[tool.coverage.run]
+source = ["backend"]
+omit = ["backend/mock_bank/seed.py"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]

@@ -1,0 +1,59 @@
+# 银枢 YinShu —— 一键起完整环境
+#   docker compose up -d --build     启动
+#   docker compose logs -f app       看日志
+#   docker compose down              停止（数据保留在 named volume）
+#
+# 演示环境：http://localhost:8000
+services:
+  bank:
+    build: .
+    image: yinshu:1.0.0
+    container_name: yinshu-bank
+    command: ["python", "-m", "uvicorn", "backend.mock_bank.api:app",
+              "--host", "0.0.0.0", "--port", "8010", "--log-level", "warning"]
+    environment:
+      YINSHU_ENV: prod
+      YINSHU_DATA_DIR: /app/data
+    volumes:
+      - yinshu-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8010/v1/health',timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  app:
+    build: .
+    image: yinshu:1.0.0
+    container_name: yinshu-app
+    depends_on:
+      bank:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      YINSHU_ENV: prod
+      YINSHU_HOST: 0.0.0.0
+      YINSHU_DATA_DIR: /app/data
+      YINSHU_BANK_BASE: http://bank:8010
+      YINSHU_SESSION_BACKEND: sqlite
+      YINSHU_WORKERS: "2"
+      YINSHU_RATE_LIMIT_RPM: "120"
+      YINSHU_LOG_JSON: "1"
+      # 接大模型时在这里注入，不写进镜像
+      # YINSHU_LLM_KEY: ${YINSHU_LLM_KEY}
+    volumes:
+      - yinshu-data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys;sys.exit(0 if urllib.request.build_opener(urllib.request.ProxyHandler({})).open('http://127.0.0.1:8000/readyz',timeout=2).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    read_only: false
+
+volumes:
+  yinshu-data:
