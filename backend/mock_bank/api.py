@@ -36,6 +36,32 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _uid(x_user_id: str | None) -> int:
+    """调用方主体。
+
+    这是**内网跳**：上游网关把自己校验过的 uid 放 `X-User-Id` 传下来，
+    核心系统据此做数据隔离与归属校验。Mock 核心只监听 127.0.0.1，
+    真实银行这一跳应走 mTLS / 服务网格身份，不能靠裸 header。
+    """
+    try:
+        return int(x_user_id) if x_user_id else 1
+    except ValueError:
+        raise HTTPException(400, {"code": "BAD_USER", "message": "X-User-Id 非法"})
+
+
+def _own(table: str, row_id: int, uid: int, what: str) -> None:
+    """归属校验：不是自己的资源一律拒绝，**失败关闭**。
+
+    没有这一步，一旦上游把账户/收款人传错，"多租户"就会变成"跨用户动钱"。
+    宁可报错，也不能猜。
+    """
+    r = _conn.execute(f"SELECT user_id FROM {table} WHERE id=?", (row_id,)).fetchone()
+    if not r:
+        raise HTTPException(404, {"code": "NOT_FOUND", "message": f"{what}不存在"})
+    if int(r["user_id"]) != uid:
+        raise HTTPException(403, {"code": "FORBIDDEN", "message": f"{what}不属于当前用户"})
+
+
 def _row2dict(r) -> dict:
     return {k: r[k] for k in r.keys()}
 

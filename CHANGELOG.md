@@ -74,6 +74,30 @@
   13 场剧本白天 13/13、凌晨 11/13。新增 `backend/core/clock.py` + `YINSHU_FIXED_HOUR`
   （仅非 prod，只钉小时不动日期），测试与评测均固定时钟。
 
+### 第二批：架构拆分 + HTTP 层加固 + 输入鲁棒性
+
+- **`main.py` 拆分**：领域逻辑下沉到 `backend/services/`（`view` / `context` / `confirm` /
+  `choose`），`main.py` 1108 → 692 行，只剩 HTTP 编排（路由、状态机分派、运维接口、
+  异常处理、装配）。`services/` 层**不 import fastapi**，可被评测脚本与渠道 adapter 复用。
+  为此把 `_jsonable/_notice/_card_text/_guard_check/_resp…` 等改名为公开名
+  （`jsonable/notice/card_text/guard_check/build_response…`）。
+- **版本化入口改成中间件**：`/api` 与 `/api/v1` 原先双 `include_router`，
+  而 FastAPI 0.162 下 `include_in_schema=False` 不生效 → OpenAPI 每个接口重复一份、
+  还刷 Duplicate Operation ID 警告。新增 `VersionAlias` 中间件在进路由前改写路径，
+  路由只注册一份，文档 14 → 7 条。
+- **`BodyLimit` 补 chunked 绕过**：只信 `Content-Length` 时，分块传输可以无限灌；
+  现在长度缺失就边读边数，超限立刻 413。
+- **跨境判定数据化**：`"HSBC" in bank` 这种猜法既会漏（内地汇丰）也会误伤；
+  改为核心系统给出的 `payees.cross_border` 标记（入参加列式迁移，旧库自动补）。
+- **输入归一化 `backend/nlu/normalize.py`**：NFKC（全角数字）+ 去零宽/双向控制字符 +
+  去 emoji + 空白折叠。emoji、全角、粘贴带进来的不可见字符不再让规则失配。
+  **不做**繁简转换（半套词表比不做更危险），登记为已知缺口。
+- **规则补两处**：转账动词支持「打/转/汇/付 + 数字」；问句形态
+  （有什么/有哪些/推荐/介绍）优先归到理财对比，不急着下申购单。
+- **扰动集**：新增 `tests/cases/perturb.jsonl`（24 条：emoji/全角/零宽/空格/同义动词），
+  `run_eval` 起单列一栏并在报告里声明「这不是留出集」——作者写完据其修了两条规则。
+- **测试**：135 → **168 条**（新增 `test_http_hardening.py` 5 条、`test_nlu_robustness.py` 28 条）。
+
 ## [1.0.0] — 2026-10-27
 
 从"能跑的 demo"升级为"可交付级产品"。核心是**可运维、可对接、可审计**。

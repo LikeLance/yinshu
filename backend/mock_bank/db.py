@@ -53,6 +53,8 @@ CREATE TABLE IF NOT EXISTS payees (
     relation TEXT,                             -- 母亲/父亲/同事/房东/朋友
     city TEXT DEFAULT '绵阳',
     blacklisted INTEGER NOT NULL DEFAULT 0,
+    -- 是否跨境账户：由核心系统明确给出，不靠"银行名里有没有 HSBC"这种猜测
+    cross_border INTEGER NOT NULL DEFAULT 0,
     created_at TEXT
 );
 
@@ -161,6 +163,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
     have = {r["name"] for r in conn.execute("PRAGMA table_info(holds)")}
     if "idem_key" not in have:
         conn.execute("ALTER TABLE holds ADD COLUMN idem_key TEXT")
+    have_p = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
+    if "cross_border" not in have_p:
+        conn.execute("ALTER TABLE payees ADD COLUMN cross_border INTEGER NOT NULL DEFAULT 0")
+        # 旧库补齐：跨境账户只认城市，不猜银行名
+        conn.execute("UPDATE payees SET cross_border=1 WHERE city IN ('香港','澳门','台湾')")
     # 幂等键唯一（部分索引：NULL 不参与唯一性，历史行不受影响）
     conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_holds_idem ON holds(idem_key)"
                  " WHERE idem_key IS NOT NULL")

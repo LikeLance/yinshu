@@ -5,6 +5,9 @@
 """
 from __future__ import annotations
 
+import re
+
+from backend.nlu.normalize import normalize
 from backend.nlu.slots import (parse_amount, parse_card_last4, parse_keyword_after, parse_memo,
                                parse_payee, parse_people, parse_period, parse_when)
 
@@ -43,8 +46,12 @@ def _norm_cmd(text: str) -> str:
 
 
 def parse(text: str) -> dict:
-    """返回 {intent, confidence, slots}。slots 里空缺的字段由 planner 决定是否追问。"""
-    t = (text or "").strip()
+    """返回 {intent, confidence, slots}。slots 里空缺的字段由 planner 决定是否追问。
+
+    进来先过一遍无损归一化：emoji / 全角 / 零宽 / 多余空格都会让规则失配，
+    这些是输入噪音，不该算成"用户表达不清楚"。
+    """
+    t = normalize(text)
     low = t.lower()
     when = parse_when(t)
     amount = parse_amount(t)
@@ -96,7 +103,10 @@ def parse(text: str) -> dict:
                    product_keyword=parse_keyword_after(t, ("赎回", "把")))
 
     # 10) 申购
-    if any(k in t for k in ("买", "申购", "买入", "投")) and (amount or any(k in t for k in ("理财", "基金", "产品", "债"))):
+    # 「有什么理财可以买」是**在问**，不是**要买**：问句形态归到对比，别急着下申购单
+    asking = any(k in t for k in ("有什么", "有哪些", "哪些", "推荐", "介绍", "怎么选"))
+    if (not asking) and any(k in t for k in ("买", "申购", "买入", "投")) and \
+            (amount or any(k in t for k in ("理财", "基金", "产品", "债"))):
         return out("wealth.subscribe", 0.88, amount=amount,
                    product_keyword=parse_keyword_after(t, ("买", "申购", "投")))
 
@@ -107,7 +117,8 @@ def parse(text: str) -> dict:
     # 12/13) 账单
     if any(k in t for k in ("异常", "奇怪", "盗刷", "不对劲", "可疑", "乱扣")):
         return out("bill.anomaly", 0.92, period=parse_period(t))
-    if any(k in t for k in ("账单", "花了", "花哪", "花在", "消费", "支出", "开销", "报告", "花费", "钱都")):
+    if any(k in t for k in ("账单", "花了", "花哪", "花在", "消费", "支出", "开销",
+                            "报告", "花费", "钱都", "花销", "流水", "账目", "查账")):
         return out("bill.summary", 0.92, period=parse_period(t))
 
     # 14) 余额
@@ -115,7 +126,7 @@ def parse(text: str) -> dict:
         return out("balance.query", 0.9)
 
     # 15) 转账（区分定时 / 即时）
-    if any(k in t for k in ("转", "汇", "打钱", "付款", "付给")):
+    if any(k in t for k in ("转", "汇", "打钱", "付款", "付给")) or re.search(r"(打|转|汇|付)\s*\d", t):
         intent = "transfer.schedule" if (when["explicit"] and (when["recurrence"] or when["date"])) else "transfer.create"
         return out(intent, 0.9, payee_raw=parse_payee(t), amount=amount, memo=parse_memo(t))
 

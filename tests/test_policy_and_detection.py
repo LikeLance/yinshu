@@ -110,7 +110,7 @@ def test_amount_in_sentence_still_executes(client, clean_bank):
 
 def test_guard_checks_card_numbers_too():
     """卡片里的数字也要过幻觉闸——用户最信的就是卡片上那行金额。"""
-    from backend.main import _guard_check
+    from backend.services.view import guard_check as _guard_check
 
     allowed = {"8000.00", "8000"}
     clean_card = {"type": "receipt", "title": "转账成功", "rows": [["金额", "8000.00 元"]]}
@@ -122,7 +122,7 @@ def test_guard_checks_card_numbers_too():
 
 def test_indirect_injection_in_tool_output_is_flagged():
     """商户名/备注里的注入指令也要被识别（L2 提示隔离）。"""
-    from backend.main import _scan_tool_output
+    from backend.services.view import scan_tool_output as _scan_tool_output
     from backend.planner.executor import Outcome
 
     out = Outcome(results={
@@ -135,7 +135,7 @@ def test_indirect_injection_in_tool_output_is_flagged():
 
 
 def test_clean_tool_output_is_not_flagged():
-    from backend.main import _scan_tool_output
+    from backend.services.view import scan_tool_output as _scan_tool_output
     from backend.planner.executor import Outcome
 
     out = Outcome(results={"s1": {"merchant": "腾讯视频VIP", "memo": "生活费"}})

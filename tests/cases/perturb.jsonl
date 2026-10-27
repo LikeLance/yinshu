@@ -1,0 +1,24 @@
+{"text": "给我妈转500😊", "intent": "transfer.create", "amount": "500"}
+{"text": "给我妈 转 500", "intent": "transfer.create", "amount": "500"}
+{"text": "给我妈转５００", "intent": "transfer.create", "amount": "500"}
+{"text": "给我妈转500​", "intent": "transfer.create", "amount": "500"}
+{"text": " 帮我 转 8000 ", "intent": "transfer.create", "amount": "8000"}
+{"text": "帮我看看这个月的流水", "intent": "bill.summary"}
+{"text": "我这个月花销怎么样", "intent": "bill.summary"}
+{"text": "查一下账目", "intent": "bill.summary"}
+{"text": "给我妈打500", "intent": "transfer.create", "amount": "500"}
+{"text": "汇300给房东", "intent": "transfer.create", "amount": "300"}
+{"text": "转2000给李慧", "intent": "transfer.create", "amount": "2000"}
+{"text": "每月1号给房东转2500", "intent": "transfer.schedule", "amount": "2500"}
+{"text": "有哪些自动续费的", "intent": "sub.list"}
+{"text": "把腾讯视频退订了吧", "intent": "sub.cancel", "keyword": "腾讯视频"}
+{"text": "帮我把卡冻结", "intent": "card.freeze"}
+{"text": "我的卡挂失", "intent": "card.loss"}
+{"text": "卡里还剩多少钱", "intent": "balance.query"}
+{"text": "买点稳健理财，1000块", "intent": "wealth.subscribe", "amount": "1000"}
+{"text": "有什么理财可以买", "intent": "wealth.compare"}
+{"text": "赎回安心债基100元", "intent": "wealth.redeem", "amount": "100"}
+{"text": "最近有什么奇怪的消费", "intent": "bill.anomaly"}
+{"text": "这顿380我们4个人AA一下", "intent": "transfer.collect", "amount": "380", "people": 4}
+{"text": "下周三我妈生日，帮我准备准备", "intent": "cross.birthday"}
+{"text": "额度调到3万", "intent": "card.limit", "amount": "30000"}

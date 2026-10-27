@@ -97,12 +97,13 @@ def seed() -> None:
         (4, "王强", "135****2233", "农业银行", "2233", "房东", "绵阳", 0),
         (5, "陈晓", "136****7788", "招商银行", "7788", "朋友", "绵阳", 0),
         (6, "刘洋", "131****9900", "邮储银行", "9900", "朋友", "绵阳", 1),   # 黑名单
-        (7, "赵敏", "852-****1234", "HSBC HK", "1234", "同事", "香港", 0),  # 跨境
+        (7, "赵敏", "852-****1234", "HSBC HK", "1234", "同事", "香港", 0),  # 跨境（见下方 cross_border）
     ]
     for pid, name, phone, bank, last4, rel, city, bl in payees:
-        cur.execute("INSERT INTO payees(id,user_id,name,phone,bank,account_last4,relation,city,blacklisted,created_at)"
-                    " VALUES(?,1,?,?,?,?,?,?,?,?)",
-                    (pid, name, phone, bank, last4, rel, city, bl, "2024-03-01 10:00:00"))
+        cur.execute("INSERT INTO payees(id,user_id,name,phone,bank,account_last4,relation,"
+                    "city,blacklisted,cross_border,created_at) VALUES(?,1,?,?,?,?,?,?,?,?,?)",
+                    (pid, name, phone, bank, last4, rel, city, bl,
+                     1 if pid == 7 else 0, "2024-03-01 10:00:00"))
 
     # ---------- 理财货架 ----------
     for p in PRODUCTS:

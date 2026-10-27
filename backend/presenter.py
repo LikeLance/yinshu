@@ -327,3 +327,38 @@ def build(intent: str, plan: Plan, out: Outcome, decision: Decision | None,
     if not text:
         text = "这件事我还不会办，换个说法或换成转账、账单、理财、卡片、订阅类的事儿试试。"
     return text, card, extra
+
+
+def confirm_rows(plan: Plan, slots: dict, out: executor.Outcome) -> list[list[str]]:
+    rows: list[list[str]] = []
+    payee = ((out.results.get("s1") or {}).get("payee") or {})
+    if payee:
+        rows.append(["收款人", f"{payee.get('name')}（{payee.get('relation')}，尾号 {payee.get('account_last4')}）"])
+    if slots.get("amount") is not None:
+        rows.append(["金额", f"{Decimal(str(slots['amount'])):.2f} 元"])
+    if slots.get("budget") is not None:
+        rows.append(["预算", f"{Decimal(str(slots['budget'])):.2f} 元"])
+    if slots.get("gift_name"):
+        rows.append(["礼物", slots["gift_name"]])
+        if slots.get("gift_amount"):
+            rows.append(["金额", f"{Decimal(str(slots['gift_amount'])):.2f} 元"])
+    w = slots.get("when") or {}
+    if w.get("label"):
+        rows.append(["时间", w["label"]])
+    if slots.get("memo"):
+        rows.append(["备注", slots["memo"]])
+    picked = (out.results.get("s1") or {}).get("picked")
+    if isinstance(picked, dict):
+        if picked.get("name"):
+            rows.append(["产品" if "risk" in picked else "标的", f"{picked['name']}"])
+        if picked.get("risk"):
+            rows.append(["风险等级", f"{picked['risk']} / 业绩基准 {picked.get('annual_rate')}%"])
+        if picked.get("merchant"):
+            rows.append(["订阅", f"{picked['merchant']}（{picked['amount']} 元/{picked['cycle']}）"])
+        if picked.get("last4"):
+            rows.append(["卡片", f"尾号 {picked['last4']}"])
+        if picked.get("amount") and "cycle" not in picked:
+            rows.append(["持仓金额", f"{picked['amount']} 元"])
+    if not rows:
+        rows.append(["动作", plan.steps[-1].label or plan.steps[-1].tool])
+    return rows

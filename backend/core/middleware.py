@@ -100,19 +100,68 @@ class RateLimit(BaseHTTPMiddleware):
         return await call_next(request)
 
 
+def _too_large(limit: int) -> JSONResponse:
+    metrics.inc("yinshu_rejected_total", reason="body_too_large")
+    return JSONResponse(
+        {"ok": False, "error": {"code": "BODY_TOO_LARGE",
+                                "message": f"请求体超过 {limit} 字节"}},
+        status_code=413)
+
+
 class BodyLimit(BaseHTTPMiddleware):
+    """请求体体积上限。
+
+    只信 `Content-Length` 是能被绕过的：分块传输（chunked）根本不带这个头，
+    攻击者可以一边发一边无限灌。所以长度缺失时**边读边数**，超限立刻断。
+    """
+
     async def dispatch(self, request: Request, call_next) -> Response:
-        if request.method in ("POST", "PUT", "PATCH"):
-            try:
-                length = int(request.headers.get("content-length") or 0)
-            except ValueError:
-                length = 0
-            if length > config.MAX_BODY_BYTES:
-                metrics.inc("yinshu_rejected_total", reason="body_too_large")
-                return JSONResponse(
-                    {"ok": False, "error": {"code": "BODY_TOO_LARGE",
-                                            "message": f"请求体超过 {config.MAX_BODY_BYTES} 字节"}},
-                    status_code=413)
+        if request.method not in ("POST", "PUT", "PATCH"):
+            return await call_next(request)
+
+        limit = config.MAX_BODY_BYTES
+        raw_len = request.headers.get("content-length")
+        try:
+            length = int(raw_len) if raw_len is not None else None
+        except ValueError:
+            length = None
+
+        if length is not None and length > limit:
+            return _too_large(limit)
+
+        if length is None:
+            total, chunks = 0, []
+            async for chunk in request.stream():
+                total += len(chunk)
+                if total > limit:
+                    return _too_large(limit)
+                chunks.append(chunk)
+            body = b"".join(chunks)
+
+            async def _replay():
+                return {"type": "http.request", "body": body, "more_body": False}
+
+            request._receive = _replay          # noqa: SLF001  下游还要读一次
+
+        return await call_next(request)
+
+
+class VersionAlias(BaseHTTPMiddleware):
+    """把 `/api/v1/xxx` 在进入路由前改写成 `/api/xxx`。
+
+    为什么不在 app 上挂两遍路由：`include_router` 的 `include_in_schema=False`
+    在 FastAPI 0.162 下不生效，双挂载会让 OpenAPI 里每个接口重复一份、
+    并刷一堆 "Duplicate Operation ID" 警告。路由只注册一份、在边缘做别名，
+    既保持了 `/api/v1` 的兼容性，文档也干净。
+    """
+
+    FROM = "/api/v1/"
+    TO = "/api/"
+
+    async def dispatch(self, request: Request, call_next) -> Response:
+        path = request.scope.get("path", "")
+        if path.startswith(self.FROM):
+            request.scope["path"] = self.TO + path[len(self.FROM):]
         return await call_next(request)
 
 
