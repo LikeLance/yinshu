@@ -178,14 +178,17 @@ def _context(plan: Plan, slots: dict, out: executor.Outcome, stats: dict, inj: b
     if action == "wealth.order":
         picked = (out.results.get("s1") or {}).get("picked") or {}
         level = stats.get("risk_level", "C3")
-        if picked.get("risk"):
-            unsuitable = RISK_ORDER[picked["risk"]] > CUSTOMER_ORDER[level]
+        risk = picked.get("risk")
+        if risk in RISK_ORDER:                    # 脏数据不能让整条链路 500
+            unsuitable = RISK_ORDER[risk] > CUSTOMER_ORDER.get(level, 3)
 
     return policy.Context(
         action=action, amount=amt,
         payee_blacklisted=bool(payee.get("blacklisted")),
         payee_whitelisted=pid in known if pid else True,
-        payee_new=(pid not in recent) if pid else False,
+        # 拿不到收款人时按"陌生收款人"处理（往安全侧偏）；
+        # 原实现是 False，等于悄悄少加 10 分。
+        payee_new=(pid not in recent) if pid else True,
         payee_relation=payee.get("relation") or "",
         cross_border=("香港" in str(payee.get("city") or "")) or ("HSBC" in str(payee.get("bank") or "")),
         device_trusted=s.device_trusted,
@@ -235,6 +238,53 @@ def _confirm_rows(plan: Plan, slots: dict, out: executor.Outcome) -> list[list[s
 
 def _notice(tone: str, title: str, lines: list[str], **extra) -> dict:
     return {"type": "notice", "tone": tone, "title": title, "lines": lines, **extra}
+
+
+def _card_text(card: dict | None) -> str:
+    """抽出卡片上所有"用户会读到的文字"，用于幻觉校验。
+
+    原实现只校验 reply，卡片完全不过闸——而卡片里的数字恰恰是用户最信的那部分
+    （"已向 X 转账 8000 元" 写在卡片上比写在正文里更像事实）。
+    """
+    if not isinstance(card, dict):
+        return ""
+    parts: list[str] = []
+    for k in ("title", "note"):
+        v = card.get(k)
+        if isinstance(v, str):
+            parts.append(v)
+    for row in card.get("rows") or []:
+        parts.extend(str(x) for x in row)
+    for line in card.get("lines") or []:
+        parts.append(str(line))
+    return " ".join(parts)
+
+
+def _guard_check(text_out: str, card: dict | None, allowed: set[str]) -> list[str]:
+    return guard.check(text_out, allowed) + guard.check(_card_text(card), allowed)
+
+
+_UNTRUSTED_KEYS = ("memo", "reason", "merchant", "name", "title", "desc")
+
+
+def _scan_tool_output(out: executor.Outcome) -> injection.ScanResult:
+    """把工具结果里"人写的文本"当不可信数据扫一遍（L2 提示隔离）。"""
+    fields: dict[str, str] = {}
+    for r in out.results.values():
+        if not isinstance(r, dict):
+            continue
+        for k in _UNTRUSTED_KEYS:
+            v = r.get(k)
+            if isinstance(v, str) and v:
+                fields[k] = v
+        for sub in ("payee", "picked"):
+            nested = r.get(sub)
+            if isinstance(nested, dict):
+                for k in ("name", "memo", "merchant"):
+                    v = nested.get(k)
+                    if isinstance(v, str) and v:
+                        fields[f"{sub}_{k}"] = v
+    return injection.scan_untrusted_data(fields)
 
 
 # ---------------- 确认阶段：指纹 / 快照 / 漂移 ----------------
@@ -387,6 +437,16 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
             (c for c in out.results["s1"].get("candidates", []) if c["id"] == forced_payee),
             out.results["s1"].get("payee"))
 
+    # L2 间接注入：工具返回的备注/商户名/产品名同样是"会进入上下文的数据"。
+    # 原实现只在 injection.py 里定义了 scan_untrusted_data 却没人调用——
+    # 这条防线是断的，而银行场景里"商户名"恰恰是最容易被人塞指令的地方。
+    indirect = _scan_tool_output(out)
+    if indirect.flagged:
+        inj = True
+        audit.append(trace, "indirect_injection",
+                     {"hits": indirect.hits, "weight": indirect.weight, "level": indirect.level},
+                     "blocked" if indirect.level == "high" else "ok")
+
     # 不可逆/限额类卡片操作：名下有多张卡又没说哪张时，必须先问，不能默认挑一张
     if intent in ("card.loss", "card.freeze", "card.limit"):
         cards = (out.results.get("s1") or {}).get("cards") or []
@@ -431,7 +491,7 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
                                   "kind": card.get("kind"),
                                   "options": (out.results.get("s2") or {}).get("gifts") or []})
         all_facts = executor.facts(slots, out.results, extra)
-        bad = guard.check(text_out, all_facts)
+        bad = _guard_check(text_out, card, all_facts)
         audit.append(trace, "read_only", {"intent": intent}, "ok")
         return {"reply": text_out, "card": card,
                 "debug": {"intent": intent, "guard_violations": bad,
@@ -473,7 +533,7 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
                 "debug": {"intent": intent, "error": e.code, "compensated": out.compensated}}
     text_out, card, extra = build_presentation(intent, plan, out, d, slots)
     all_facts = executor.facts(slots, out.results, extra)
-    bad = guard.check(text_out, all_facts)
+    bad = _guard_check(text_out, card, all_facts)
     if bad:
         text_out = "操作已完成，详细结果见下方卡片。"
         audit.append(trace, "guard_rewrite", {"violations": bad}, "ok")
@@ -656,6 +716,24 @@ def _chat_inner(request: Request, req: ChatReq, p: identity.Principal, trace: st
             return JSONResponse(_resp(s, trace, "好的，已取消，这笔不会执行。",
                                       _notice("info", "已取消", ["未发生任何资金变动"]),
                                       {"cancelled": True}, t0))
+        # 「好的，不过改成 600」：以确认词开头、但金额与待确认的不一致 →
+        # 按新金额重走一遍，**绝不能**当成"确认原金额"。
+        amt_now = parse_amount(text)
+        pend_amt = (s.stash.get("snapshot") or {}).get("amount")
+        if amt_now is not None and pend_amt is not None and nlu.starts_with_confirm(text):
+            try:
+                changed = Decimal(str(amt_now)) != Decimal(str(pend_amt))
+            except Exception:                                  # noqa: BLE001
+                changed = False
+            if changed:
+                intent0 = s.stash.get("intent") or "transfer.create"
+                slots0 = {**(s.stash.get("slots") or {}), "amount": amt_now}
+                fsm.reset(s)
+                audit.append(trace, "confirm_amount_modified",
+                             {"from": str(pend_amt), "to": str(amt_now)}, "ok")
+                res = _handle(s, text, intent0, slots0, trace, scan.level != "clean")
+                return JSONResponse({**_resp(s, trace, res["reply"], res["card"],
+                                             res.get("debug", {}), t0)})
         if nlu.is_confirm(text):
             if s.stash.get("double") and s.stash.get("confirm_n", 0) < 1:
                 s.stash["confirm_n"] = 1
@@ -729,6 +807,15 @@ def _chat_inner(request: Request, req: ChatReq, p: identity.Principal, trace: st
                        "有哪些自动续费", "下周三我妈生日，帮我准备一下"]},
             {"intent": "unknown", "confidence": p["confidence"]}, t0))
 
+    # 否定式：「别给我妈转钱」不能被当成"转多少"的授权
+    if nlu.is_negation(text):
+        fsm.reset(s)
+        audit.append(trace, "negation", {"intent": p["intent"]}, "ok")
+        return JSONResponse(_resp(
+            s, trace, "好的，这次不执行。",
+            _notice("info", "已取消", ["没有发起任何操作"]),
+            {"intent": p["intent"], "negation": True}, t0))
+
     res = _handle(s, text, p["intent"], p["slots"], trace, scan.level != "clean")
     dbg = {"intent": p["intent"], "intent_label": nlu.INTENT_LABEL.get(p["intent"]),
            "confidence": p["confidence"], "slots": p["slots"], **res.get("debug", {})}
@@ -765,7 +852,7 @@ def _run_plan(s: fsm.Session, plan: Plan, intent: str, slots: dict, trace: str, 
                 "debug": {"decision": d.to_dict(), "error": e.code,
                           "compensated": out.compensated}}
     text_out, card, extra = build_presentation(intent, plan, out, d, slots)
-    bad = guard.check(text_out, executor.facts(slots, out.results, extra))
+    bad = _guard_check(text_out, card, executor.facts(slots, out.results, extra))
     fsm.reset(s)
     return {"reply": text_out, "card": card, "debug": {"decision": d.to_dict(), "guard_violations": bad}}
 
@@ -837,7 +924,7 @@ def _execute_pending(s: fsm.Session, trace: str, t0: float, p: Any = None) -> di
                      {"error": e.code, "compensated": fresh.compensated}, t0)
 
     text_out, card, extra = build_presentation(intent, plan, out, d2, slots)
-    bad = guard.check(text_out, executor.facts(slots, out.results, extra))
+    bad = _guard_check(text_out, card, executor.facts(slots, out.results, extra))
     if bad:
         text_out = "操作已完成，详细结果见下方卡片。"
         audit.append(trace, "guard_rewrite", {"violations": bad}, "ok")

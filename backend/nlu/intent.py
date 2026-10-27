@@ -29,8 +29,17 @@ INTENT_LABEL = {
 }
 
 CONFIRM_WORDS = {"确认", "确定", "好的", "好", "可以", "是", "是的", "对", "行", "转吧", "办吧",
-                 "ok", "okay", "嗯", "同意", "执行", "就这个", "第一个", "第二个", "第三个"}
+                 "ok", "okay", "嗯", "同意", "执行", "就这个"}
 CANCEL_WORDS = {"取消", "算了", "不用了", "不要", "停止", "别", "不了", "再想想"}
+
+# 否定式：别/不要/不用 + 资金动作
+NEG_WORDS = ("别", "不要", "不用", "先别", "暂不", "不想", "别再", "无需")
+MONEY_VERBS = ("转", "汇", "付", "打钱", "买", "申购", "挂失", "冻结", "取", "扣")
+_PUNCT = "，。！？、,.!?~～ \t\r\n\"'"
+
+
+def _norm_cmd(text: str) -> str:
+    return (text or "").strip().strip(_PUNCT).lower()
 
 
 def parse(text: str) -> dict:
@@ -114,10 +123,49 @@ def parse(text: str) -> dict:
 
 
 def is_confirm(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return any(t == w or t.startswith(w) for w in CONFIRM_WORDS)
+    """整句就是一句确认。
+
+    原实现用 `startswith`，于是「好的，不过改成 600」也被判成确认，
+    直接把原金额转了出去——这是最危险的一类误判：用户明明改了主意。
+    现在要求整句去标点后**就是**确认词，或确认词 + 极短附着语（≤6 字）。
+    """
+    t = _norm_cmd(text)
+    if not t:
+        return False
+    if t in CONFIRM_WORDS:
+        return True
+    return len(t) <= 6 and any(t.startswith(w) for w in CONFIRM_WORDS)
+
+
+def starts_with_confirm(text: str) -> bool:
+    """以确认词开头（允许后面跟修正内容），用于识别"确认 + 改口径"。"""
+    t = _norm_cmd(text)
+    return bool(t) and any(t.startswith(w) for w in CONFIRM_WORDS)
 
 
 def is_cancel(text: str) -> bool:
     t = (text or "").strip().lower()
     return any(t == w or t.startswith(w) for w in CANCEL_WORDS)
+
+
+def is_negation(text: str) -> bool:
+    """识别"别给我妈转钱"这类否定句。
+
+    原实现只看动词：句子里有「转」就判 transfer.create，接着追问"转多少"——
+    用户说的是"不要转"，系统理解成"转多少"，这是把拒绝当成了授权。
+
+    判别条件：否定词后面 4 个字内出现资金动作词，且**句子里没有金额**。
+    没有金额这一条很关键——「不用确认了直接转500」有金额，那是真的想转
+    （它属于绕过风控的可疑指令，该由注入检测降级处理，而不是当否定句）。
+    """
+    t = (text or "").strip()
+    if not t or parse_amount(t) is not None:
+        return False
+    for w in NEG_WORDS:
+        i = t.find(w)
+        if i < 0:
+            continue
+        window = t[i + len(w): i + len(w) + 4]
+        if any(v in window for v in MONEY_VERBS):
+            return True
+    return False

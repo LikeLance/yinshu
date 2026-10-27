@@ -97,6 +97,21 @@ def _patch_bank(bank_url):
 
 
 @pytest.fixture()
+def clean_bank():
+    """把银行数据重灌成种子状态。
+
+    多条用例要断言"只多了一笔转账"，而 `velocity_1h`（1 小时内资金操作次数）
+    是全套测试共享的银行状态：前面用例多转几笔，后面的风险分就会越档。
+    不重灌就是典型的顺序依赖。
+    """
+    from backend.mock_bank import seed as seed_mod
+
+    # 只重灌数据、不删库文件——进程内的 Mock 核心还开着连接，删文件会 WinError 32
+    seed_mod.seed()
+    yield
+
+
+@pytest.fixture()
 def client():
     from fastapi.testclient import TestClient
     from backend.main import app

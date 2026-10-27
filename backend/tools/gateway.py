@@ -236,7 +236,10 @@ def _post(name: str, data: dict, local: dict | None = None) -> dict:
             raise PayeeNotFound(data.get("query", ""))
         top = cands[0]
         tied = [c for c in cands if abs(c["score"] - top["score"]) < 1e-6]
-        if len(tied) > 1 and len({c["relation"] for c in tied}) > 1:
+        # 只看"关系是否不同"是不够的：两个同名同关系的联系人（同班同学、两个同事）
+        # 会被静默取第一个，而产品对外的承诺是"绝不猜"。
+        # 只要并列，就出候选卡让用户自己点。
+        if len(tied) > 1:
             data["chosen"] = None
             data["ambiguous"] = True
             data["options"] = tied

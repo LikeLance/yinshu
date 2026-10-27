@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Literal
+from typing import Callable, Literal
 
 from backend.core.config import POLICY_FILE
 
@@ -24,9 +24,60 @@ def config() -> dict:
     global _cfg_cache, _cfg_mtime
     m = POLICY_FILE.stat().st_mtime
     if _cfg_cache is None or m != _cfg_mtime:
-        _cfg_cache = json.loads(POLICY_FILE.read_text(encoding="utf-8"))
+        cfg = json.loads(POLICY_FILE.read_text(encoding="utf-8"))
+        _validate(cfg)
+        _cfg_cache = cfg
         _cfg_mtime = m
     return _cfg_cache
+
+
+# 硬规则的谓词表。config/policy.json 里的 `when` 只能取这里的键，
+# 配错了启动即报错——原实现把这四条写死在 decide() 里，
+# 改 json 的 hard_rules 完全不生效，"银行改配置无需改代码"是句空话。
+# 阈值（如 5 万）也由 json 的 args 给，改阈值同样不用碰代码。
+PREDICATES: dict[str, Callable[[Context, dict], bool]] = {
+    "payee_blacklisted": lambda c, a: c.payee_blacklisted,
+    "wealth_unsuitable": lambda c, a: c.wealth_unsuitable,
+    "amount_gt_50000": lambda c, a: (
+        c.amount > Decimal(str(a.get("amount", 50000))) and c.action.startswith("transfer")),
+    "payee_cross_border": lambda c, a: c.cross_border,
+}
+
+
+def _rule(rule: dict) -> Callable[[Context], bool]:
+    fn = PREDICATES[rule["when"]]
+    args = rule.get("args") or {}
+    return lambda c: fn(c, args)
+
+
+def _reason(rule: dict) -> str:
+    """reason 里可以引用 args（如 {amount_display}），改阈值时文案跟着变。"""
+    text = str(rule.get("reason") or "")
+    args = rule.get("args") or {}
+    if "{" not in text:
+        return text
+    try:
+        return text.format(**args)
+    except (KeyError, IndexError, ValueError):
+        return text
+
+
+def _validate(cfg: dict) -> None:
+    problems = []
+    for kind in ("deny", "handoff"):
+        for rule in (cfg.get("hard_rules") or {}).get(kind) or []:
+            if rule.get("when") not in PREDICATES:
+                problems.append(f"hard_rules.{kind} 未知谓词：{rule.get('when')}")
+            if not rule.get("reason"):
+                problems.append(f"hard_rules.{kind} 缺少 reason：{rule.get('when')}")
+    for name, val in (cfg.get("tiers") or {}).items():
+        if not isinstance(val, int):
+            problems.append(f"tiers.{name} 必须是整数")
+    for k, v in (cfg.get("weights") or {}).items():
+        if not isinstance(v, int):
+            problems.append(f"weights.{k} 必须是整数")
+    if problems:
+        raise RuntimeError("config/policy.json 配置错误：" + "；".join(problems))
 
 
 @dataclass
@@ -66,7 +117,11 @@ class Decision:
 
 def score(ctx: Context) -> tuple[int, list[str]]:
     cfg = config()
-    s = cfg["weights"].get(ctx.action, 15)
+    weights = cfg["weights"]
+    if ctx.action not in weights:
+        # 不再静默兜底成 15：拼错 key / 新增动作忘了配权重，会悄悄按低风险放行
+        raise KeyError(f"policy.json 的 weights 缺少动作 {ctx.action}，拒绝按默认值放行")
+    s = weights[ctx.action]
     why: list[str] = [f"基础风险：{ctx.action}（{s} 分）"]
     f = cfg["features"]
 
@@ -94,18 +149,17 @@ def score(ctx: Context) -> tuple[int, list[str]]:
 def decide(ctx: Context) -> Decision:
     cfg = config()
     t = cfg["tiers"]
+    rules = cfg.get("hard_rules") or {}
 
-    # ---- 硬规则优先于打分 ----
-    if ctx.payee_blacklisted:
-        return Decision("DENY", 100, ["收款人命中反诈黑名单，为保护您的资金已拒绝"], hard_rule="blacklist")
-    if ctx.wealth_unsuitable:
-        return Decision("DENY", 100, ["该产品风险等级高于您的风险承受能力（适当性管理）"],
-                        hard_rule="unsuitable")
-    if ctx.amount > Decimal("50000") and ctx.action.startswith("transfer"):
-        return Decision("HANDOFF", 85, ["单笔金额超过 5 万元，按监管要求需人工复核"],
-                        hard_rule="amount_gt_50000")
-    if ctx.cross_border:
-        return Decision("HANDOFF", 80, ["收款账户为跨境账户，需人工审核"], hard_rule="cross_border")
+    # ---- 硬规则优先于打分，且**完全由 config/policy.json 驱动** ----
+    for rule in rules.get("deny") or []:
+        if _rule(rule)(ctx):
+            return Decision("DENY", int(rule.get("risk", 100)), [_reason(rule)],
+                            hard_rule=rule.get("rule") or rule["when"])
+    for rule in rules.get("handoff") or []:
+        if _rule(rule)(ctx):
+            return Decision("HANDOFF", int(rule.get("risk", 85)), [_reason(rule)],
+                            hard_rule=rule.get("rule") or rule["when"])
 
     risk, why = score(ctx)
     if risk <= t["auto_max"]:

@@ -31,12 +31,17 @@
   },
   "hard_rules": {
     "deny": [
-      {"when": "payee_blacklisted", "reason": "收款人命中反诈黑名单"},
-      {"when": "wealth_unsuitable", "reason": "产品风险等级高于您的风险承受能力（适当性管理）"}
+      {"when": "payee_blacklisted", "rule": "blacklist", "risk": 100,
+       "reason": "收款人命中反诈黑名单，为保护您的资金已拒绝"},
+      {"when": "wealth_unsuitable", "rule": "unsuitable", "risk": 100,
+       "reason": "该产品风险等级高于您的风险承受能力（适当性管理）"}
     ],
     "handoff": [
-      {"when": "amount_gt_50000", "reason": "单笔金额超过 5 万元，需人工复核"},
-      {"when": "payee_cross_border", "reason": "跨境收款需人工审核"}
+      {"when": "amount_gt_50000", "rule": "amount_gt_50000", "risk": 85,
+       "args": {"amount": 50000, "amount_display": "5 万元"},
+       "reason": "单笔金额超过 {amount_display}，按监管要求需人工复核"},
+      {"when": "payee_cross_border", "rule": "cross_border", "risk": 80,
+       "reason": "收款账户为跨境账户，需人工审核"}
     ],
     "double_confirm": ["card.loss"]
   },

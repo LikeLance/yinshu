@@ -21,21 +21,6 @@ def _bank_count(table: str) -> int:
         c.close()
 
 
-@pytest.fixture()
-def clean_bank():
-    """把银行数据重置到种子状态。
-
-    这两条用例要断言"只多了一笔转账"，而 `velocity_1h`（1 小时内资金操作次数）
-    是全套测试共享的银行状态：前面用例多转几笔，"给我妈转500"就会 +12 分
-    越档变成 CONFIRM。不重置就是典型的顺序依赖。
-    """
-    from backend.mock_bank import seed as seed_mod
-
-    # 只重灌数据，不删库文件——进程内的 Mock 核心还开着连接，删文件会 WinError 32
-    seed_mod.seed()
-    yield
-
-
 # ---------------------------------------------------------------- 幂等
 
 def test_same_idempotency_key_executes_once(client, clean_bank):
