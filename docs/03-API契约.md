@@ -22,12 +22,28 @@
 
 | HTTP | code | 触发场景 |
 |---|---|---|
-| 401 | `UNAUTHORIZED` | 配置了 `YINSHU_API_KEYS` 但未带/带错 `X-API-Key` |
+| 401 | `UNAUTHORIZED` | 配置了 `YINSHU_API_KEYS` 但未带/带错 `X-API-Key`；或 `AUTH_MODE=required` 而缺少/带错令牌 |
+| 403 | `SESSION_OWNER_MISMATCH` | 会话不属于当前主体（防止拿别人的 sid 替他确认） |
+| 403 | `IDENTITY_IN_BODY` | 请求体里出现身份字段（身份只能来自 `Authorization` 头） |
 | 404 | `NOT_FOUND` | 路径不存在 |
+| 409 | `IN_PROGRESS` | 同一幂等键的请求正在处理中（重复提交） |
 | 413 | `BODY_TOO_LARGE` | 请求体超过 64KB |
-| 422 | `INVALID_REQUEST` | 参数校验失败 |
+| 422 | `INVALID_REQUEST` | 参数校验失败（含 `ChatReq` 的未知字段） |
+| 422 | `IDEMPOTENCY_KEY_REUSED` | 同一个 `X-Idempotency-Key` 被用在了不同的请求体上 |
 | 429 | `RATE_LIMITED` | 超限流，响应头含 `Retry-After` |
 | 500 | `INTERNAL_ERROR` | 未预期异常（堆栈只进日志） |
+
+### 安全相关请求头（v1.1）
+
+| 头 | 必需 | 说明 |
+|---|---|---|
+| `Authorization: Bearer <JWT>` | `AUTH_MODE=required` 时必需 | HS256；载荷含 `sub`(uid) / `did`(设备) / `ch`(渠道) / `iat` / `exp` / `jti`。**身份只认这个头**，请求体里的 `user_id` 会被 422 拒绝 |
+| `X-Idempotency-Key` | 资金类操作建议必带 | 客户端生成的业务单号。同一个 key + 同一请求体只会执行一次，重放返回首次响应（带 `x-idempotent-replay: true`）；同 key 不同体会 422 |
+| `X-Device-Id` | 建议 | 设备标识，仅用于服务端做设备画像（是否非常用设备）；**不代表可信**，可信由服务端按历史判定 |
+| `X-Request-Id` | 可选 | 透传到 `trace_id` 与审计，便于跨系统串联 |
+
+> 未带 `X-Idempotency-Key` 时服务端会按 `(uid, 设备, 请求体, 待确认事务)` 派生一个兜底 key，
+> 窗口 10 分钟，只覆盖网络重试；**真正的业务幂等请显式带 key**。
 
 ---
 

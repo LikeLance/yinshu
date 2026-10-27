@@ -2,6 +2,78 @@
 
 本文件按 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/) 组织，版本号遵循语义化版本。
 
+## [1.1.0] — 2026-10-27
+
+按"能否上线"的标准做了一轮加固。核心是**把"说了但没做到"的地方补齐**：
+评审发现 6 处会直接击穿卖点的问题（审计链、确认态、幂等、身份、策略配置、限流顺序），
+全部修复并配了可复现用例。完整报告见 `docs/review-2026-10-27.md`。
+
+### 修复（都会在真实压力下出事）
+
+- **审计链多进程分叉（P0）**：原实现靠进程内 `threading.Lock` 保护"读尾→插入"，
+  而 `--prod` 是多 worker。实测 4 进程 × 50 条产生 **10~11 组分叉**，`verify()` 直接报断链。
+  改为 thread-local 双连接 + `BEGIN IMMEDIATE` 跨进程互斥；补 `busy_timeout`；
+  `verify()` 改分块校验 + 检查点（不再整表进内存）；加 `chain_ver` 版本分派，旧库原地升级不断链。
+- **确认阶段 TOCTOU（P0）**：原实现把 preview 快照落盘，点确认后**直接拿最多 5 分钟前的状态执行**，
+  期间余额变化/收款人被拉黑/频率上升全不重算。现在确认时重新 preview + 重算指纹 + 重新决策，
+  漂移分 HARD（重建确认卡）/ SOFT（执行并留痕）两级；并用 `UPDATE ... WHERE ver=?` 做跨进程 CAS 防连点。
+- **幂等键随请求漂移（P0）**：原来 `Idempotency-Key = trace_id-step_id`，而 trace 每次请求新生成
+  → 客户端重试必重复扣款。改为按 `(uid, device, 请求体, 待确认事务)` 派生，或由客户端显式
+  `X-Idempotency-Key`；下游 `mock_bank /v1/holds` 补强制幂等头 + 唯一索引。
+- **会话即凭证（P0）**：`session_id` 是唯一认证物，拿到一个 `AWAIT_CONFIRM` 的 sid 发"确认"
+  就能触发转账。现在会话绑定 `owner_uid/owner_device`，跨主体 403；`device_trusted` 不再采信客户端自述。
+- **`policy.json` 的 hard_rules 是摆设（P0）**：`decide()` 把四条硬规则写死在 if 里，
+  改 json 完全不生效。改为谓词表解释执行，`when/args/risk/reason` 全部由配置驱动，
+  5 万阈值也走 `args`；配置错误在加载时 fail-fast。
+- **限流在鉴权内层（P0）**：`ApiKeyGate` 在 `RateLimit` 外面，401 请求永远消耗不到令牌桶。
+  中间件顺序改为 `CORS → RequestContext → RateLimit → ApiKeyGate → BodyLimit`。
+- **L2 间接注入未接线（P1）**：`injection.scan_untrusted_data` 定义了从没被调用。
+  现在工具返回的备注/商户名/产品名都要过一遍，命中即强制升档。
+- **资金悬挂（P1）**：`gift.order` 失败后锁定的预算永不释放。补 `on_fail=compensate` +
+  补偿器签名扩为 `(out, sid, plan)`。
+- **确认词过宽（P1）**：「好的，不过改成 600」会被判成确认并转出原金额。改为整句匹配 +
+  金额冲突分支（改成新金额重走，绝不执行原金额）。
+- **否定句当授权（P1）**：「别给我妈转钱」原先追问"转多少"。新增否定意图识别。
+- **同名同关系静默取第一个（P1）**：与"绝不猜"的承诺不符，改为只要并列就出候选卡。
+- **卡片不过幻觉闸（P1）**：原先只校验 `reply`，而卡片上的金额才是用户最信的。
+
+### 新增
+
+- **身份层** `backend/security/identity.py`：标准库手写 HS256 JWT（零新增依赖），
+  身份只认 `Authorization` 头（请求体里出现 `user_id` 直接 422）；
+  `YINSHU_AUTH_MODE=off|optional|required`，**默认 off**，保证现有演示与测试零改动。
+- **服务端幂等** `backend/core/idempotency.py`：只缓存"真的落地了"的响应（回执卡），
+  中间态标 failed 允许继续推进；显式 key 24h、派生 key 10min。
+- **计划指纹** `backend/planner/fingerprint.py`：对**解析后的真实参数**做哈希
+  （只哈希 Plan 不够——`$s1.chosen` 两次解析可能指向不同收款人）。
+- **请求级上下文** `backend/core/reqctx.py`：ContextVar 承载主体 / trace / 幂等种子。
+- **审计脱敏** `backend/security/pii.py`：`payload` 落库前脱敏，原文只存 HMAC 摘要进 `pii_vault`；
+  审计加 `actor_id/device_id/ip/channel` 并纳入哈希（追责维度）。
+- **链尾锚定**：`Anchor` 协议 + `LocalTableAnchor` + `HttpAnchor`（接 WORM/存证）；
+  `lifespan` 定期锚定，`verify()` 比对锚点，能发现"整表重写 + 本地重算"。
+- **进程内入口** `handle_chat(req, headers, ip)`：不依赖 FastAPI 的 `Request`，
+  给评测脚本与其他渠道 adapter 用。
+- **测试**：105 → **135 条**（新增并发、幂等、TOCTOU、策略配置、检测各一组）；
+  另加 `tests/stress_audit_multiproc.py` 多进程验枪工具。
+
+### 变更（可能影响集成方）
+
+- `ChatReq` 改 `extra="forbid"`：请求体里带 `user_id`/`uid` 等未知字段会 **422**。
+- `device_trusted` 字段保留但**已忽略**；设备身份改用 `X-Device-Id` 头。
+- 幂等键算法变了（`yinshu:v2:...`），**旧的在途幂等键不会命中**，升级时请清在途请求。
+- `audit_logs` / `sessions` / `holds` 三张表加列，**有自动迁移，无需重建**；
+  但 1.0.0 的老行 `chain_ver=1`，校验时按旧公式处理。
+- `_on_yinshu_error` 新增映射：`SESSION_OWNER_MISMATCH` / `UNAUTHORIZED` / `IDENTITY_IN_BODY` → 403。
+- 评测报告 `docs/04-评测报告.md` 自带时钟固定声明（14:00），结果不再随运行时刻漂移。
+
+### 可复现性修复
+
+- `--basetemp=.tmp/pytest` 在 pytest 9 + 全新克隆下直接 `FileNotFoundError`（`.tmp/` 被 gitignore），
+  6 条用例 ERROR。改由 conftest 导入时创建父目录。
+- 权限引擎的"凌晨 0-6 点 +10 分"直接读 wall clock，导致同一句话白天 AUTO、凌晨 CONFIRM，
+  13 场剧本白天 13/13、凌晨 11/13。新增 `backend/core/clock.py` + `YINSHU_FIXED_HOUR`
+  （仅非 prod，只钉小时不动日期），测试与评测均固定时钟。
+
 ## [1.0.0] — 2026-10-27
 
 从"能跑的 demo"升级为"可交付级产品"。核心是**可运维、可对接、可审计**。
