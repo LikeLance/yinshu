@@ -13,39 +13,22 @@ import re
 from datetime import date, timedelta
 from decimal import Decimal
 
-CN_DIGITS = {"零": 0, "〇": 0, "一": 1, "壹": 1, "二": 2, "两": 2, "贰": 2, "三": 3, "叁": 3,
-             "四": 4, "肆": 4, "五": 5, "伍": 5, "六": 6, "陆": 6, "七": 7, "柒": 7,
-             "八": 8, "捌": 8, "九": 9, "玖": 9}
-CN_UNITS = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000, "万": 10000}
+from backend.core import clock, cnnum
+
+CN_DIGITS = cnnum.DIGITS
+CN_UNITS = cnnum.UNITS
 WEEKDAY = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
 CN_WEEK_LABEL = "一二三四五六日"
 
 
 def cn2num(s: str) -> int | None:
-    """中文数字转整数：五百→500；两千五→2500；十五→15；一万二→12000。"""
-    if not s:
-        return None
-    total = section = num = 0
-    last_unit = 0
-    for ch in s:
-        if ch in CN_DIGITS:
-            num = CN_DIGITS[ch]
-        elif ch in CN_UNITS:
-            unit = CN_UNITS[ch]
-            if unit == 10000:
-                section = (section + num) * unit
-                total += section
-                section = 0
-            else:
-                section += (num or 1) * unit
-            last_unit = unit
-            num = 0
-        else:
-            return None
-    # 「一千二」「两千五」这类省略尾数：末尾数字按上一个单位的十分之一计
-    if num and last_unit >= 100:
-        return total + section + num * (last_unit // 10)
-    return total + section + num
+    """中文数字转整数：五百→500；两千五→2500；十五→15；一万二→12000；一百零五→105。
+
+    实现在 `backend/core/cnnum.py`，这里只保留旧名字 ——
+    这个算法曾经在 NLU 和幻觉校验各存一份，然后只修了一处，
+    结果「转一百零五块」被 NLU 解析成 150 元。金额逻辑不能有两个真相。
+    """
+    return cnnum.to_int(s)
 
 
 # ---------------- 打码：把不该被当成金额/时间的东西遮住 ----------------
@@ -122,9 +105,18 @@ WEEKLY = re.compile(r"每(?:个)?(?:周|星期|礼拜)([一二三四五六日天
 DAILY = re.compile(r"每天|每日")
 WEEKDAY_RE = re.compile(r"(下下|下|这|本)?(?:个)?(?:周|星期|礼拜)([一二三四五六日天])")
 MONTHDAY_RE = re.compile(r"(下个?月|这个?月)?\s*(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]")
-DAY_ONLY_RE = re.compile(r"(下个?月)?\s*(\d{1,2})\s*[号日]")
 TIME_RE = re.compile(r"(上午|早上|中午|下午|晚上|夜里|凌晨)?\s*(\d{1,2})\s*(?:[点时]|\:)(?:\s*(\d{1,2})\s*分?)?")
 HOUR_WORD = {"上午": 0, "早上": 0, "中午": 0, "下午": 12, "晚上": 12, "夜里": 12, "凌晨": 0}
+
+
+def _last_day(y: int, m: int) -> int:
+    return [31, 29 if y % 4 == 0 and (y % 100 != 0 or y % 400 == 0) else 28,
+            31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1]
+
+
+def _date_in_month(y: int, m: int, day: int) -> date:
+    """该月的第 day 天；超出本月天数就取月末（「每月31号」在 2 月落到 28/29 号）。"""
+    return date(y, m, min(max(day, 1), _last_day(y, m)))
 
 
 def _add_month(d: date, n: int) -> date:
@@ -133,9 +125,7 @@ def _add_month(d: date, n: int) -> date:
         y, m = y + 1, m - 12
     while m < 1:
         y, m = y - 1, m + 12
-    day = min(d.day, [31, 29 if y % 4 == 0 and (y % 100 != 0 or y % 400 == 0) else 28,
-                      31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
-    return date(y, m, day)
+    return _date_in_month(y, m, d.day)
 
 
 def _label(d: date, hh: str | None = None) -> str:
@@ -145,7 +135,7 @@ def _label(d: date, hh: str | None = None) -> str:
 
 def parse_when(text: str, today: date | None = None) -> dict:
     """返回 {date, time, recurrence, label, explicit}。recurrence 形如 monthly:1 / weekly:0。"""
-    today = today or date.today()
+    today = today or clock.now().date()
     out: dict = {"date": None, "time": None, "recurrence": None, "label": None, "explicit": False}
 
     # 时刻
@@ -162,12 +152,14 @@ def parse_when(text: str, today: date | None = None) -> dict:
     # 周期
     mm = MONTHLY.search(text)
     if mm:
-        day = int(mm.group(1))
-        first = today
-        if today.day >= day:
-            first = _add_month(today.replace(day=min(day, 28)), 1)
-        else:
-            first = today.replace(day=min(day, 28))
+        day = min(max(int(mm.group(1)), 1), 31)
+        # 首次执行日必须落在未来。原来用 today.replace(day=min(day, 28))：
+        # 「每月31号」会被悄悄改成 28 号 —— 今天 29 号时首次执行日是**已经过去的 10-28**，
+        # label 却写着「每月31号」，定时任务就按这个日期排下去了。
+        first = _date_in_month(today.year, today.month, day)
+        if first < today:
+            nxt = _add_month(today.replace(day=1), 1)
+            first = _date_in_month(nxt.year, nxt.month, day)
         hh = out["time"] or "09:00"
         out.update(date=first.isoformat(), time=hh, recurrence=f"monthly:{day}",
                    label=f"每月{day}号 {hh}", explicit=True)
@@ -213,16 +205,23 @@ def parse_when(text: str, today: date | None = None) -> dict:
                 cand = monday + timedelta(days=idx)
                 d = cand if cand >= today else cand + timedelta(days=7)
     if d is None:
-        do = DAY_ONLY_RE.search(mask_noise(text))
-        if do and ("号" in text or "日" in text):
-            day = int(do.group(2))
-            if 1 <= day <= 31:
-                base = _add_month(today, 1) if do.group(1) else today
-                try:
-                    cand = base.replace(day=day)
-                except ValueError:
-                    cand = base
-                d = cand if cand >= today else _add_month(cand, 1)
+        # 只说「26号 / 26日」：必须在**原文**上找。
+        # 原实现在 mask_noise(text) 上匹配 `(\d{1,2})[号日]`，可 mask 已经把数字换成 □，
+        # 这条分支永远不可达 —— 用户说了日期，系统当没说。
+        for hit in re.finditer(r"(?<![\d])(\d{1,2})\s*[号日]", text):
+            day = int(hit.group(1))
+            if not 1 <= day <= 31:
+                continue
+            lead = text[max(0, hit.start() - 6):hit.start()]
+            if "尾号" in lead:                 # 「尾号6621」不是日期
+                continue
+            base = _add_month(today.replace(day=1), 1) if "下个" in lead else today
+            cand = _date_in_month(base.year, base.month, day)
+            if cand < today:                   # 这个月的这天已经过了 → 顺延到下个月
+                nxt = _add_month(base.replace(day=1), 1)
+                cand = _date_in_month(nxt.year, nxt.month, day)
+            d = cand
+            break
     if d is not None:
         out.update(date=d.isoformat(), label=_label(d, out["time"]), explicit=True)
     return out
@@ -231,7 +230,7 @@ def parse_when(text: str, today: date | None = None) -> dict:
 # ---------------- 账单周期 ----------------
 
 def parse_period(text: str, today: date | None = None) -> dict:
-    today = today or date.today()
+    today = today or clock.now().date()
     first = today.replace(day=1)
     if any(k in text for k in ("上月", "上个月")):
         prev_last = first - timedelta(days=1)

@@ -216,11 +216,14 @@ def _pick(items: list[dict], key: str, needle: str, data: dict) -> dict:
 
     pool = items
     hit = [x for x in pool if raw and raw in str(x.get(key, ""))]
-    if not hit and raw:
+    if not hit and len(raw) >= 2:
         scored = []
         for x in pool:
             r = difflib.SequenceMatcher(None, raw, str(x.get(key, ""))).ratio()
-            if r >= 0.5:
+            # 门槛 0.7（原 0.5）：这个函数服务于"取消订阅/挂失"这类不可逆动作，
+            # 0.5 会让「爱奇艺体育」配上「爱奇艺黄金会员」（ratio 恰好 0.50），
+            # 用户取消一个自己没有的服务，系统把另一个退了。
+            if r >= 0.7:
                 scored.append((r, x))
         scored.sort(key=lambda t: -t[0])
         hit = [x for _, x in scored]
@@ -307,18 +310,26 @@ def _post(name: str, data: dict, local: dict | None = None) -> dict:
 
     if name == "wealth.holdings":
         items = data.get("holdings") or []
-        kw = local.get("keyword") or ""
+        kw = (local.get("keyword") or "").strip()
         hit = [h for h in items if kw and kw in (h.get("name") or "")]
         if len(hit) == 1:
             data["chosen"] = hit[0]["id"]
             data["picked"] = hit[0]
-        elif not hit and items:
-            data["chosen"] = items[0]["id"]
-            data["picked"] = items[0]
-        else:
+        elif len(hit) > 1:
             data["chosen"] = None
             data["ambiguous"] = True
-            data["options"] = hit or items
+            data["options"] = hit
+        elif not kw:
+            # 没说赎回哪支 → 出候选让用户选，不替他挑
+            data["chosen"] = None
+            data["ambiguous"] = bool(items)
+            data["options"] = items
+            data["not_found"] = not items
+        else:
+            # 关键词对不上任何一个持仓。原来这里是 `chosen = items[0]`，
+            # 等于"用户说要赎回 A，系统默默卖掉 B"——赎回不可逆，这是资金事故级的猜。
+            data["chosen"] = None
+            data["not_found"] = True
         return data
 
     return data
