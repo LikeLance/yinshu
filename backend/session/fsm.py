@@ -48,7 +48,10 @@ class Session:
         if ts and time.time() - ts > CONFIRM_TTL:
             self.state = "IDLE"
             self.stash = {}
-            save(self)
+            # 必须真删库：`_persist` 对「IDLE + 空 stash」是跳过的，只清内存的话
+            # 库里那条 AWAIT_CONFIRM 会一直活着 —— 之后每次带同一个 sid 进来都会
+            # 又读到它、又判超时，用户卡在"已超时"循环里直到会话 TTL 才自愈。
+            STORE.delete(self.sid)
             return True
         return False
 

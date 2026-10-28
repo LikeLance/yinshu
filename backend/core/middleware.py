@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import hmac
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -21,19 +23,36 @@ log = get("http")
 
 _SKIP_LOG = {"/healthz", "/readyz", "/metrics", "/favicon.ico"}
 
+# 长度 ≥6 的十六进制或纯数字段视为"标识符"（trace_id/uuid/自增 id），归一成一个固定标签。
+_ID_SEG = re.compile(r"(?:[0-9a-fA-F]{6,}|\d+)")
+
 
 def _client_key(request: Request) -> str:
-    """限流键：优先取真实来源 IP（反代场景看 X-Forwarded-For 第一跳）。"""
-    xff = request.headers.get("x-forwarded-for")
-    if xff:
-        return xff.split(",")[0].strip()
+    """限流键：只有在明确配置了可信反代时才采信 X-Forwarded-For。
+
+    默认信任 XFF 等于把限流做成装饰品 —— 换个请求头就是新身份，
+    顺便把审计里的来源 IP 也一起污染了。
+    """
+    if config.TRUST_PROXY:
+        xff = request.headers.get("x-forwarded-for")
+        if xff:
+            return xff.split(",")[0].strip()
     return request.client.host if request.client else "unknown"
 
 
 def _route_label(request: Request) -> str:
-    """用路由模板而不是原始路径做标签，避免 /api/audit/<uuid> 把指标撑爆。"""
+    """指标标签：优先用路由模板，避免 /api/audit/<uuid> 把序列撑爆。
+
+    中间件跑在路由匹配之前，`scope["route"]` 往往是空的，于是回落到原始路径 ——
+    这时一个随机 id 就是一条新时间序列，Prometheus 的基数会随请求量无界增长。
+    回落时按"像不像 id"做归一化。
+    """
     route = request.scope.get("route")
-    return getattr(route, "path", None) or request.url.path
+    tpl = getattr(route, "path", None)
+    if tpl:
+        return tpl
+    parts = ["{id}" if _ID_SEG.fullmatch(seg) else seg for seg in request.url.path.split("/")]
+    return ("/".join(parts) or "/")[:120]
 
 
 class RequestContext(BaseHTTPMiddleware):
@@ -75,6 +94,27 @@ class RateLimit(BaseHTTPMiddleware):
         self.capacity = max(1, self.rpm)
         self.rate = self.capacity / 60.0
         self._buckets: dict[str, tuple[float, float]] = defaultdict(lambda: (self.capacity, time.time()))
+        self._ops = 0
+
+    MAX_BUCKETS = 20000          # 桶的硬上限，防止被扫 IP 打爆内存
+    IDLE_SECONDS = 600.0         # 超过这个时长没请求的桶直接回收
+
+    def _evict(self, now: float) -> None:
+        """回收冷桶。
+
+        原来 `_buckets` 只增不减：来源越散字典越大，长期跑就是慢性内存泄漏
+        （而且 defaultdict 让"读"也会创建条目）。
+        """
+        self._ops += 1
+        if len(self._buckets) <= self.MAX_BUCKETS or self._ops % 256:
+            return
+        cut = now - self.IDLE_SECONDS
+        for k in [k for k, (_t, ts) in self._buckets.items() if ts < cut]:
+            self._buckets.pop(k, None)
+        if len(self._buckets) > self.MAX_BUCKETS:
+            order = sorted(self._buckets.items(), key=lambda kv: kv[1][1])
+            for k, _ in order[: len(order) // 2]:
+                self._buckets.pop(k, None)
 
     def _take(self, key: str) -> tuple[bool, float]:
         tokens, last = self._buckets[key]
@@ -91,7 +131,9 @@ class RateLimit(BaseHTTPMiddleware):
             return await call_next(request)
         ok, wait = self._take(_client_key(request))
         if not ok:
-            metrics.inc("yinshu_rate_limited_total", path=request.url.path)
+            # 用路由模板而不是原始路径：被限流的往往是扫描器，路径千奇百怪，
+            # 原始路径当标签等于让攻击者决定你的时序基数。
+            metrics.inc("yinshu_rate_limited_total", path=_route_label(request))
             log.warning("rate_limited", path=request.url.path, ip=_client_key(request))
             return JSONResponse(
                 {"ok": False, "error": {"code": "RATE_LIMITED",
@@ -183,7 +225,8 @@ class ApiKeyGate(BaseHTTPMiddleware):
         if path in config.AUTH_EXEMPT or path.startswith(("/docs", "/redoc")):
             return await call_next(request)
         supplied = request.headers.get("x-api-key") or ""
-        if supplied in self.keys:
+        # 常量时间比较：`in set` 会按前缀提前返回，理论上能把 key 一个字符一个字符试出来
+        if supplied and any(hmac.compare_digest(supplied, k) for k in self.keys):
             return await call_next(request)
         metrics.inc("yinshu_rejected_total", reason="unauthorized")
         log.warning("unauthorized", path=path, ip=_client_key(request))

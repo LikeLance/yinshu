@@ -24,18 +24,24 @@ RISK_ORDER = {"R1": 1, "R2": 2, "R3": 3, "R4": 4, "R5": 5}
 CUSTOMER_ORDER = {"C1": 1, "C2": 2, "C3": 3, "C4": 4, "C5": 5}
 
 
-def risk_stats() -> dict:
+def risk_stats() -> tuple[dict, bool]:
+    """取风控特征，并明确告知"这次到底拿到没有"。
+
+    原来异常时静默返回 {}，调用方就会把速度/客群当成"0 次、普通客户"，
+    于是下游一超时策略反而更宽松。把可用性一起返回，由策略引擎把 AUTO 降级为 CONFIRM。
+    """
     try:
-        return gateway.call("risk.stats", {})
+        data = gateway.call("risk.stats", {})
+        return (data if isinstance(data, dict) else {}), True
     except YinshuError:
-        return {}
+        return {}, False
 
 
 # ---------------- 决策上下文 ----------------
 
 
 def build_context(plan: Plan, slots: dict, out: executor.Outcome, stats: dict, inj: bool,
-             s: fsm.Session) -> policy.Context:
+             s: fsm.Session, degraded: bool = False) -> policy.Context:
     action = plan.primary_action() or "transfer.create"
     amt = Decimal("0")
     for k in ("amount", "budget", "daily_limit"):
@@ -77,6 +83,7 @@ def build_context(plan: Plan, slots: dict, out: executor.Outcome, stats: dict, i
         segment=stats.get("segment", "普通"),
         wealth_unsuitable=unsuitable,
         injection_flagged=inj,
+        degraded=degraded,
     )
 
 

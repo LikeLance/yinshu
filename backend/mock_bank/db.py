@@ -130,6 +130,15 @@ CREATE TABLE IF NOT EXISTS holds (
     idem_key TEXT                              -- 幂等键：重复提交返回首次结果
 );
 
+-- 通用幂等表。转账/锁资金各有自己的 idem_key 列，但理财申赎与礼物下单没有，
+-- 网关明明带了 Idempotency-Key 却被直接丢掉 —— 上游一次超时重试就是一笔重复申购。
+CREATE TABLE IF NOT EXISTS idem_keys (
+    key TEXT PRIMARY KEY,                      -- "<scope>:<idempotency-key>"
+    scope TEXT NOT NULL,
+    response TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS gift_orders (
     id INTEGER PRIMARY KEY,
     user_id INTEGER NOT NULL,

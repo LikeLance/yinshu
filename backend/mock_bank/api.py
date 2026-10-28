@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
+import json
 import random
+import sqlite3
 import uuid
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -359,15 +361,34 @@ def list_transfers(limit: int = 10):
 
 # ---------------- 账单 ----------------
 
+_AGG_COLUMNS = {"category": "category", "merchant": "merchant"}
+
+
+def _agg_out(col: str, account_id: int, d0: str, d1: str) -> dict[str, tuple[int, Decimal]]:
+    """按列聚合流出金额（笔数, 金额合计）。
+
+    金额在库里是 TEXT，这里取出来用 Decimal 累加。
+    原实现是 `SUM(CAST(amount AS REAL))` —— 先转二进制浮点再求和，分位误差随笔数累积，
+    和本项目"金额一律走字符串 / Decimal、绝不碰浮点"的承诺自相矛盾。
+    """
+    sql = ("SELECT " + _AGG_COLUMNS[col] + " AS k, amount FROM transactions"
+           " WHERE account_id=? AND direction='out' AND substr(ts,1,10) BETWEEN ? AND ?")
+    rows = _conn.execute(sql, (account_id, d0, d1)).fetchall()
+    agg: dict[str, tuple[int, Decimal]] = {}
+    for r in rows:
+        k = r["k"] or ""
+        cnt, s = agg.get(k, (0, Decimal("0")))
+        agg[k] = (cnt + 1, s + D(r["amount"]))
+    return agg
+
+
 @app.get("/v1/bills/summary")
 def bill_summary(date_from: str = Query(..., alias="from"), date_to: str = Query(..., alias="to"),
                  account_id: int | None = None):
     account_id = _account_or_default(account_id)
-    rows = _conn.execute(
-        "SELECT category, COUNT(*) c, SUM(CAST(amount AS REAL)) s FROM transactions"
-        " WHERE account_id=? AND direction='out' AND substr(ts,1,10) BETWEEN ? AND ?"
-        " GROUP BY category ORDER BY s DESC", (account_id, date_from, date_to)).fetchall()
-    cats = [{"category": r["category"], "count": r["c"], "amount": f"{r['s']:.2f}"} for r in rows]
+    cat_agg = _agg_out("category", account_id, date_from, date_to)
+    cats = [{"category": k, "count": c, "amount": mq(v)} for k, (c, v) in cat_agg.items()]
+    cats.sort(key=lambda x: -D(x["amount"]))
     total = sum((D(c["amount"]) for c in cats), Decimal("0"))
     for c in cats:
         c["ratio"] = round(float(D(c["amount"]) / total * 100), 1) if total else 0.0
@@ -387,25 +408,21 @@ def bill_summary(date_from: str = Query(..., alias="from"), date_to: str = Query
 
     pf = _shift_month(_d.fromisoformat(date_from), -1)
     pt = _shift_month(_d.fromisoformat(date_to), -1)
-    prev = _conn.execute(
-        "SELECT SUM(CAST(amount AS REAL)) s FROM transactions WHERE account_id=? AND direction='out'"
-        " AND substr(ts,1,10) BETWEEN ? AND ?", (account_id, pf.isoformat(), pt.isoformat())).fetchone()
-    prev_total = D(f"{prev['s'] or 0:.2f}")
+    prev_agg = _agg_out("category", account_id, pf.isoformat(), pt.isoformat())
+    prev_total = sum((v for _c, v in prev_agg.values()), Decimal("0"))
     mom = None
     if prev_total > 0:
         mom = round(float((total - prev_total) / prev_total * 100), 1)
 
-    top = _conn.execute(
-        "SELECT merchant, SUM(CAST(amount AS REAL)) s FROM transactions WHERE account_id=? AND direction='out'"
-        " AND substr(ts,1,10) BETWEEN ? AND ? GROUP BY merchant ORDER BY s DESC LIMIT 3",
-        (account_id, date_from, date_to)).fetchall()
+    merc_agg = _agg_out("merchant", account_id, date_from, date_to)
+    top = sorted(merc_agg.items(), key=lambda kv: -kv[1][1])[:3]
     return {
         "range": f"{date_from}~{date_to}",
         "total_out": mq(total),
         "count": sum(c["count"] for c in cats),
         "categories": cats,
         "mom_pct": mom,
-        "top_merchants": [{"merchant": r["merchant"], "amount": f"{r['s']:.2f}"} for r in top],
+        "top_merchants": [{"merchant": k, "amount": mq(v[1])} for k, v in top],
     }
 
 
@@ -542,8 +559,33 @@ def holdings():
     return {"holdings": [_row2dict(r) for r in rows]}
 
 
+def _idem(scope: str, key: str | None, handler) -> dict:
+    """通用幂等封装：同一 Idempotency-Key 只真正执行一次，重试返回首次结果。
+
+    转账与锁资金各自实现了幂等，但理财申购/赎回、礼物下单没有 ——
+    网关侧明明标了 idem 并带上了头，核心系统直接无视，重试即重复下单。
+    """
+    if not key:
+        raise HTTPException(400, {"code": "IDEMPOTENCY_REQUIRED",
+                                  "message": "写操作必须携带 Idempotency-Key"})
+    full = f"{scope}:{key}"
+    hit = _conn.execute("SELECT response FROM idem_keys WHERE key=?", (full,)).fetchone()
+    if hit:
+        return {**json.loads(hit["response"]), "idempotent_replay": True}
+    resp = handler()
+    try:
+        _conn.execute("INSERT INTO idem_keys(key,scope,response,created_at) VALUES(?,?,?,?)",
+                      (full, scope, json.dumps(resp, ensure_ascii=False), _now()))
+        _conn.commit()
+    except sqlite3.IntegrityError:
+        # 并发同 key：另一路已经写进去了，忽略即可（首次结果已在库里）
+        _conn.rollback()
+    return resp
+
+
 @app.post("/v1/wealth/orders")
 def wealth_order(payload: dict = Body(...), idempotency_key: str | None = Header(default=None)):
+  def _do() -> dict:
     product = _conn.execute("SELECT * FROM products WHERE id=?", (payload["product_id"],)).fetchone()
     if not product:
         raise HTTPException(404, {"code": "PRODUCT_NOT_FOUND", "message": "产品不存在"})
@@ -570,10 +612,12 @@ def wealth_order(payload: dict = Body(...), idempotency_key: str | None = Header
     return {"order_id": cur.lastrowid, "product": product["name"], "amount": mq(amount),
             "status": "confirmed_pending", "confirm_note": "T+1 确认份额，份额以确认结果为准",
             "annual_rate": product["annual_rate"], "redeem_rule": product["redeem_rule"]}
+  return _idem("wealth.order", idempotency_key, _do)
 
 
 @app.post("/v1/wealth/redeem")
-def wealth_redeem(payload: dict = Body(...)):
+def wealth_redeem(payload: dict = Body(...), idempotency_key: str | None = Header(default=None)):
+  def _do() -> dict:
     h = _conn.execute("SELECT h.*, p.name, p.redeem_rule FROM holdings h JOIN products p ON p.id=h.product_id"
                       " WHERE h.id=?", (int(payload["holding_id"]),)).fetchone()
     if not h:
@@ -591,6 +635,7 @@ def wealth_redeem(payload: dict = Body(...)):
     _conn.commit()
     return {"holding_id": int(payload["holding_id"]), "product": h["name"], "amount": mq(amount),
             "status": "redeeming", "arrive_note": "预计 T+1 到账", "redeem_rule": h["redeem_rule"]}
+  return _idem("wealth.redeem", idempotency_key, _do)
 
 
 # ---------------- 卡片 ----------------
@@ -749,7 +794,8 @@ def gift_recommend(budget: str = "800"):
 
 
 @app.post("/v1/partner/gift/order")
-def gift_order(payload: dict = Body(...)):
+def gift_order(payload: dict = Body(...), idempotency_key: str | None = Header(default=None)):
+  def _do() -> dict:
     g = next((x for x in GIFTS if x["gift_id"] == payload["gift_id"]), None)
     if not g:
         raise HTTPException(404, {"code": "GIFT_NOT_FOUND", "message": "商品不存在"})
@@ -761,6 +807,7 @@ def gift_order(payload: dict = Body(...)):
     return {"order_id": cur.lastrowid, "gift_id": g["gift_id"], "name": g["name"],
             "amount": g["amount"], "vendor": g["vendor"], "status": "created",
             "deliver_at": payload.get("deliver_at")}
+  return _idem("gift.order", idempotency_key, _do)
 
 
 @app.get("/v1/partner/gift/orders")
