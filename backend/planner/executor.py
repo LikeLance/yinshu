@@ -14,6 +14,7 @@ from typing import Any
 
 from backend.core.errors import Ambiguous, YinshuError
 from backend.planner.contracts import Plan, Step
+from backend.security import guard
 from backend.tools import gateway
 
 def _hold_args(out: "Outcome", plan: "Plan") -> dict | None:
@@ -133,7 +134,9 @@ def _exec(plan: Plan, step: Step, out: Outcome, trace_id: str,
 
 # ---------------- 事实集：幻觉防护的比对基准 ----------------
 
-NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+# 取数规则必须与 guard.check() 一致：如果这里把「2026-10-28 22:43:06」拆成六个数字
+# 塞进白名单，而校验那边也拆，那"编造一个 22"就永远能蒙中。统一走 guard.numbers_in()。
+NUM_RE = guard.NUM_RE
 
 
 def _walk(obj: Any, acc: set[str]) -> None:
@@ -154,7 +157,7 @@ def _walk(obj: Any, acc: set[str]) -> None:
         except Exception:
             pass
     elif isinstance(obj, str):
-        acc.update(NUM_RE.findall(obj))
+        acc.update(guard.numbers_in(obj))
 
 
 def facts(slots: dict, results: dict, extra: set[str] | None = None) -> set[str]:
