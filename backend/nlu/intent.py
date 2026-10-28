@@ -60,7 +60,7 @@ def parse(text: str) -> dict:
         base = {"period": None, "payee_raw": None, "amount": None, "memo": None,
                 "when": when if when["explicit"] else None, "people": None,
                 "product_keyword": None, "card_last4": parse_card_last4(t),
-                "merchant_keyword": None, "who": None}
+                "merchant_keyword": None, "who": None, "freeze": None}
         base.update(slots)
         return {"intent": intent, "confidence": conf, "slots": base}
 
@@ -89,7 +89,11 @@ def parse(text: str) -> dict:
     if "挂失" in t:
         return out("card.loss", 0.95)
     if any(k in t for k in ("冻结", "解冻", "锁卡")):
-        return out("card.freeze", 0.93, memo="解冻" if "解冻" in t else "冻结")
+        # 方向必须是独立的结构化槽位。原来靠 memo == "解冻" 判断，
+        # 而 memo 同时是"备注"这个用户可自由填写的字段 —— 备注里出现"解冻"就能翻转语义。
+        want_freeze = "解冻" not in t
+        return out("card.freeze", 0.93, freeze=want_freeze,
+                   memo="冻结" if want_freeze else "解冻")
     if any(k in t for k in ("额度", "限额")):
         return out("card.limit", 0.9, amount=amount)
     if ("申请" in t or "办一张" in t or "办个" in t) and "卡" in t:

@@ -37,15 +37,36 @@ def stash_pending(s: fsm.Session, plan: Plan, out: executor.Outcome, ctx: policy
     })
 
 
+def irreversible_steps(plan: Plan) -> list[str]:
+    """受控且不可撤销的步骤名。
+
+    数据来自 `registry` 的 `reversible` 元数据，不是硬编码动作名 ——
+    新增一个不可逆工具时，确认卡的提示会自动跟上，不用有人记得改前端文案。
+    """
+    from backend.tools import registry
+
+    names = []
+    for st in plan.steps:
+        if not st.is_gated:
+            continue
+        spec = registry.TOOLS[st.tool]
+        if not spec.reversible:
+            names.append(st.label or spec.desc or st.tool)
+    return names
+
+
 def confirm_card(plan: Plan, slots: dict, out: executor.Outcome, d: policy.Decision,
                   extra_rows: list[list[str]] | None = None,
                   note: str = "点确认后才会真正执行；说「取消」随时终止") -> dict:
     rows = confirm_rows(plan, slots, out)
     if extra_rows:
         rows = extra_rows + rows
+    irr = irreversible_steps(plan)
     return {"type": "confirm", "title": "请确认这笔操作", "rows": rows,
             "reasons": d.reasons, "risk": d.risk, "tier": d.tier,
-            "need_double": d.require_double_confirm, "note": note}
+            "need_double": d.require_double_confirm,
+            "irreversible": bool(irr),
+            "note": note + (f"。{'、'.join(irr)}不可撤销" if irr else "")}
 
 
 # ---------------- 主处理 ----------------
@@ -63,8 +84,10 @@ def execute_pending(s: fsm.Session, trace: str, t0: float, p: Any = None) -> dic
     slots: dict = stash["slots"]
     intent: str = stash["intent"]
     inj = bool(stash.get("inj"))
+    _stats, _ok = risk_stats()
     d_old: policy.Decision = stash.get("decision") or policy.decide(
-        build_context(plan, slots, stash.get("out") or executor.Outcome(), risk_stats(), inj, s))
+        build_context(plan, slots, stash.get("out") or executor.Outcome(), _stats, inj, s,
+                      degraded=not _ok))
     confirm_id = str(stash.get("confirm_id") or uuid.uuid4().hex)
 
     # 1) 重新预览：只读步骤重跑，确认"世界还是那个世界"
@@ -80,7 +103,8 @@ def execute_pending(s: fsm.Session, trace: str, t0: float, p: Any = None) -> dic
 
     # 2) 重算指纹 + 重新决策 + 比对漂移
     fp2 = fingerprint.of(plan, slots, fresh.results)
-    ctx2 = build_context(plan, slots, fresh, risk_stats(), inj, s)
+    stats2, ok2 = risk_stats()
+    ctx2 = build_context(plan, slots, fresh, stats2, inj, s, degraded=not ok2)
     d2 = policy.decide(ctx2)
     snap2 = take_snapshot(slots, fresh, ctx2, d2)
     drift = compute_drift(stash.get("snapshot") or {}, snap2, stash.get("fp"), fp2, d_old, d2)

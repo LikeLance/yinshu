@@ -45,6 +45,10 @@ from backend.tools import gateway, registry
 
 log = get("app")
 
+# 启动期自检：注册表/策略配置错配（漏配权重、资金工具没开幂等、路径占位符对不上参数）
+# 一律在这里炸掉。宁可起不来，也别让它带着"闸门形同虚设"的配置对外服务。
+registry.assert_invariants()
+
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -142,6 +146,27 @@ class ChatReq(BaseModel):
     device_trusted: bool = Field(default=True, deprecated=True,
                                  description="已忽略；设备信任由服务端判定")
 
+
+
+def _settle(s: fsm.Session, intent: str, slots: dict, card: dict | None,
+            out: executor.Outcome) -> None:
+    """执行完把会话落到正确的下一状态。
+
+    出候选卡就进 CHOOSE 等用户选，否则归位。
+    原来只有"纯只读"分支处理了 choose 卡片 —— 一旦链路带受控步骤
+    （例如跨场景要先锁资金），候选卡发出去了、会话却停在 IDLE，
+    用户回一句"第2个"就被当成听不懂。卡片和状态机不能各走各的。
+    """
+    if card and card.get("type") == "choose":
+        # 生日流程是「先锁预算 → 选礼物 → 下单」：把 hold_id 带进下一阶段，
+        # 下单失败时才有东西可补偿（否则锁住的预算永远挂在 holds 表里）。
+        hid = first_of(out.results, "hold_id")
+        stash_slots = {**slots, **({"hold_id": hid} if hid else {})}
+        fsm.ask(s, "CHOOSE", {"intent": intent, "slots": stash_slots,
+                              "kind": card.get("kind"),
+                              "options": (out.results.get("s2") or {}).get("gifts") or []})
+    else:
+        fsm.reset(s)
 
 
 def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
@@ -242,14 +267,7 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
             return {"reply": e.user_msg, "card": notice("warn", "查询未完成", [e.user_msg]),
                     "debug": {"intent": intent, "error": e.code}}
         text_out, card, extra = build_presentation(intent, plan, out, None, slots)
-        if card and card.get("type") == "choose":
-            # 生日流程是「先锁预算 → 选礼物 → 下单」：把 hold_id 带进下一阶段，
-            # 下单失败时才有东西可补偿（否则锁住的预算永远挂在 holds 表里）。
-            hid = first_of(out.results, "hold_id")
-            stash_slots = {**slots, **({"hold_id": hid} if hid else {})}
-            fsm.ask(s, "CHOOSE", {"intent": intent, "slots": stash_slots,
-                                  "kind": card.get("kind"),
-                                  "options": (out.results.get("s2") or {}).get("gifts") or []})
+        _settle(s, intent, slots, card, out)
         all_facts = executor.facts(slots, out.results, extra)
         bad = guard_check(text_out, card, all_facts)
         audit.append(trace, "read_only", {"intent": intent}, "ok")
@@ -258,8 +276,8 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
                           "plan": [st.model_dump() for st in plan.steps]}}
 
     # ---- 权限决策 ----
-    stats = risk_stats()
-    ctx = build_context(plan, slots, out, stats, inj, s)
+    stats, stats_ok = risk_stats()
+    ctx = build_context(plan, slots, out, stats, inj, s, degraded=not stats_ok)
     d = policy.decide(ctx)
     audit.append(trace, "policy_decision", {"action": ctx.action, "amount": str(ctx.amount),
                                             "risk": d.risk, "tier": d.tier,
@@ -297,7 +315,7 @@ def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
     if bad:
         text_out = "操作已完成，详细结果见下方卡片。"
         audit.append(trace, "guard_rewrite", {"violations": bad}, "ok")
-    fsm.reset(s)
+    _settle(s, intent, slots, card, out)
     return {"reply": text_out, "card": card,
             "debug": {"intent": intent, "decision": d.to_dict(), "guard_violations": bad,
                       "plan": [st.model_dump() for st in plan.steps]}}
@@ -531,8 +549,8 @@ def run_plan(s: fsm.Session, plan: Plan, intent: str, slots: dict, trace: str, i
     """给"非 NLU 构造的 plan"（如礼物下单）用的执行入口。"""
     out = executor.Outcome()
     executor.run(plan, "preview", trace, out)
-    stats = risk_stats()
-    ctx = build_context(plan, slots, out, stats, inj, s)
+    stats, stats_ok = risk_stats()
+    ctx = build_context(plan, slots, out, stats, inj, s, degraded=not stats_ok)
     d = policy.decide(ctx)
     audit.append(trace, "policy_decision", {"action": ctx.action, "risk": d.risk, "tier": d.tier},
                  d.tier.lower())

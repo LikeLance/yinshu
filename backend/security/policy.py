@@ -96,6 +96,9 @@ class Context:
     segment: str = "普通"
     wealth_unsuitable: bool = False
     injection_flagged: bool = False
+    # 风控特征是否缺失（下游取不到）。缺失时不能当成"0 次交易、普通客户"继续放行，
+    # 否则风控下游一超时，风险分反而变小 —— 典型 fail-open。
+    degraded: bool = False
 
 
 @dataclass
@@ -168,6 +171,11 @@ def decide(ctx: Context) -> Decision:
         tier = "CONFIRM"
     else:
         tier = "HANDOFF"
+
+    # ---- 风控特征缺失：不许停在 AUTO ----
+    if ctx.degraded and tier == "AUTO":
+        tier = "CONFIRM"
+        why.append("本次未能取到完整风控特征，已自动降级为需确认")
 
     # ---- 注入降级：检测到可疑指令，一律往安全侧挪一档 ----
     if ctx.injection_flagged and cfg.get("injection_downgrade", True):

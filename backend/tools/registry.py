@@ -103,12 +103,51 @@ _reg(ToolSpec("transfer.collect", "POST", "/v1/transfers/collect",
               action="transfer.collect", money=False, idem=True, desc="AA 收款"))
 _reg(ToolSpec("hold.create", "POST", "/v1/holds",
               {"amount": str, "reason": str, "expire_at": str}, ("amount",), {},
-              action="hold.create", reversible=True, idem=True, desc="锁定专项资金"))
+              # 锁资金不转钱，但它占用可用余额、是真实的状态变更。
+              # gated=False 时整条跨场景链路会被判成"纯只读"，在 preview 阶段直接执行 ——
+              # 用户还没确认礼物，专项资金已经被锁了，而且全程没走 policy.decide。
+              action="hold.create", gated=True, reversible=True, idem=True, desc="锁定专项资金"))
 _reg(ToolSpec("hold.release", "POST", "/v1/holds/{hold_id}/release",
               {"hold_id": int}, ("hold_id",), {},
-              action="hold.create", reversible=True, idem=True, desc="释放锁定资金"))
+              action="hold.create", gated=True, reversible=True, idem=True, desc="释放锁定资金"))
 
 MONEY_ACTIONS = {n for n, s in TOOLS.items() if s.money}
+
+
+class RegistryInvariantError(RuntimeError):
+    """注册表与策略配置对不上。这种错必须在启动期炸，不能等第一笔交易才发现。"""
+
+
+def assert_invariants() -> None:
+    """启动期自检：注册表是资金链路的唯一入口，它的完整性不该靠"记得改"。
+
+    检查项都对应过真实错配：
+    - 资金写操作必须可去重（`idem=True`），否则一次重试就是一笔重复扣款；
+    - 受控动作必须有 `action`，否则 `Plan.primary_action()` 返回 None，策略只能按未知动作兜底；
+    - 每个 `action` 都要在 policy.json 里有基础分，否则 `score()` 会直接抛（他们改成 fail-fast 了）；
+    - `required` 必须是 `args` 子集，路径占位符必须取得到值（否则拼出 404 的 URL）。
+    """
+    from backend.security import policy
+
+    weights = policy.config()["weights"]
+    problems: list[str] = []
+    for s in TOOLS.values():
+        if s.money and not s.idem:
+            problems.append(f"{s.name}: 资金类工具必须 idem=True（重试不能变成重复扣款）")
+        if s.is_gated and not s.action:
+            problems.append(f"{s.name}: 受控工具必须声明 action")
+        if s.action and s.action not in weights:
+            problems.append(f"{s.name}: action={s.action} 在 policy.json 的 weights 里没有基础分")
+        for k in s.required:
+            if k not in s.args:
+                problems.append(f"{s.name}: required 里的 {k} 不在 args 声明中")
+        for part in s.path.split("/"):
+            if part.startswith("{") and part.endswith("}"):
+                ph = part[1:-1]
+                if ph not in s.args:
+                    problems.append(f"{s.name}: 路径占位符 {{{ph}}} 没有对应的参数声明")
+    if problems:
+        raise RegistryInvariantError("工具注册表自检失败：\n  - " + "\n  - ".join(problems))
 
 
 def get(name: str) -> ToolSpec:
@@ -120,4 +159,5 @@ def get(name: str) -> ToolSpec:
 def catalog() -> list[dict]:
     """给规划器 / 调试台看的工具清单。"""
     return [{"name": s.name, "desc": s.desc, "args": {k: v.__name__ for k, v in s.args.items()},
-             "money": s.money, "reversible": s.reversible} for s in TOOLS.values()]
+             "money": s.money, "gated": s.is_gated, "reversible": s.reversible,
+             "idem": s.idem, "action": s.action} for s in TOOLS.values()]

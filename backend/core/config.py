@@ -82,6 +82,10 @@ IDEMPOTENCY_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_TTL", str(24 * 3600)))
 IDEMPOTENCY_AUTO_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_AUTO_TTL", "600"))
 IDEMPOTENCY_INFLIGHT_TTL = int(os.getenv("YINSHU_IDEMPOTENCY_INFLIGHT_TTL", "30"))
 
+# 是否信任 X-Forwarded-For。默认不信任 —— 裸跑时任何人换个请求头就是一个"新身份"，
+# 限流与审计里的来源 IP 都跟着失真。只有确实在可信反代后面才置 1。
+TRUST_PROXY = os.getenv("YINSHU_TRUST_PROXY", "0").strip() == "1"
+
 DEMO_USER_ID = int(os.getenv("YINSHU_USER_ID", "1"))
 # 兜底账户（仅核心系统不可用/无账户时使用）；正常路径按主体解析真实账户
 DEMO_ACCOUNT_ID = int(os.getenv("YINSHU_ACCOUNT_ID", "1"))

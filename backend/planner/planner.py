@@ -153,9 +153,13 @@ def build(intent: str, slots: dict, account_id: int = ACCOUNT_ID) -> Plan:
             steps.append(Step(id="s2", tool="card.limit",
                               args={"card_id": "$s1.chosen", "daily_limit": _amount(amt)}, label="调整限额"))
         elif intent == "card.freeze":
+            # 方向取结构化槽位 `freeze`；memo 只是给用户看的备注，不参与判定
+            want_freeze = s.get("freeze")
+            if want_freeze is None:                    # 兼容旧调用方（补槽路径可能没带）
+                want_freeze = s.get("memo") != "解冻"
             steps.append(Step(id="s2", tool="card.freeze",
-                              args={"card_id": "$s1.chosen", "freeze": s.get("memo") != "解冻"},
-                              label="冻结卡片" if s.get("memo") != "解冻" else "解冻卡片"))
+                              args={"card_id": "$s1.chosen", "freeze": bool(want_freeze)},
+                              label="冻结卡片" if want_freeze else "解冻卡片"))
         else:
             steps.append(Step(id="s2", tool="card.loss", args={"card_id": "$s1.chosen"},
                               label="挂失卡片", on_fail="abort"))
