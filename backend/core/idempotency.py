@@ -66,10 +66,10 @@ def _conn() -> sqlite3.Connection:
 
 
 def derive_key(uid: int, device_id: str, body: bytes) -> str:
-    """客户端没给 X-Idempotency-Key 时的兜底：同样的主体 + 同样的请求体 = 同一笔。
+    """在客户端未提供 X-Idempotency-Key 时派生兜底键。
 
-    这不是"完美幂等"（用户真的想重复转两笔同额会撞上），但比"每次都当新请求"安全得多；
-    生产上应由客户端显式提供 key，guidance 见 docs/03-API契约.md。
+    相同主体和相同请求体会被视为同一笔请求，因此短时间内连续提交相同转账时
+    可能被合并。生产调用方应显式提供幂等键，接口说明见 docs/03-API契约.md。
     """
     h = hashlib.sha256()
     h.update(str(uid).encode())
@@ -82,13 +82,12 @@ def derive_key(uid: int, device_id: str, body: bytes) -> str:
 
 def begin(uid: int, scope: str, key: str, request_hash: str,
           ttl: int | None = None) -> Slot:
-    """抢占执行权。返回 owner 才可以真正执行，其余三种直接按状态返回。
+    """抢占执行权，仅 owner 状态可以继续执行。
 
-    ttl 区分两种键：
-    - 客户端显式给的 X-Idempotency-Key → 用长窗口（默认 24h），
-      语义是"这个业务单号我只处理一次"；
-    - 服务端按请求体派生的兜底键 → 短窗口，只覆盖网络重试，
-      否则用户上午转 500、下午再转 500 会被误判成重放。
+    ttl 区分两类键：
+    - 客户端显式提供的 X-Idempotency-Key 使用长窗口，默认 24 小时；
+    - 服务端派生的兜底键使用短窗口，只覆盖网络重试，
+      否则用户上午和下午各转 500 元时，第二笔会被误判为重放。
     """
     life = ttl if ttl is not None else config.IDEMPOTENCY_TTL
     now = time.time()

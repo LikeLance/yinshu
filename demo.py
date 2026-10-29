@@ -1,10 +1,10 @@
-"""银枢 · 演示脚本（走真实 HTTP 接口，可用于录屏 / 答辩现场跑流程）。
+"""银枢命令行演示脚本，通过真实 HTTP 接口依次执行预设场景。
 
 用法：
-    python start.py            # 另开一个终端，先把服务起起来
-    python demo.py             # 跑完整剧本
-    python demo.py --fast      # 只跑主链路 6 场
-    python demo.py --reset     # 先把演示数据恢复原样再跑（反复演示/录屏用）
+    python start.py            # 先在另一个终端启动服务
+    python demo.py             # 执行完整剧本
+    python demo.py --fast      # 执行主链路 6 个场景
+    python demo.py --reset     # 重置演示数据后执行
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ def show(d: dict) -> None:
     c = d.get("card") or {}
     tier = (d["debug"].get("decision") or {}).get("tier") or "—"
     if c.get("type") == "receipt":
-        tier = "已执行"   # 确认后真正落地的回执，不该再显示 CONFIRM
+        tier = "已执行"   # 回执表示动作已完成，不再显示确认档位
     print(f"   ↳ [{tier}] {d['reply']}")
     if c.get("type") == "confirm":
         for k, v in c["rows"]:
@@ -81,7 +81,7 @@ def main() -> int:
             httpx.post("http://127.0.0.1:8010/v1/admin/reset", timeout=20, trust_env=False).raise_for_status()
             print("[demo] 已重置演示数据")
         except Exception as e:                                    # noqa: BLE001
-            print(f"[demo] 重置失败（Mock 核心系统没起来？）：{e}")
+            print(f"[demo] 重置失败，请检查 Mock 核心系统：{e}")
             return 1
     idx = FAST if fast else range(len(SCRIPT))
     sid = None

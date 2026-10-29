@@ -28,10 +28,9 @@ _ID_SEG = re.compile(r"(?:[0-9a-fA-F]{6,}|\d+)")
 
 
 def _client_key(request: Request) -> str:
-    """限流键：只有在明确配置了可信反代时才采信 X-Forwarded-For。
+    """限流键。仅在配置可信反向代理时采信 X-Forwarded-For。
 
-    默认信任 XFF 等于把限流做成装饰品 —— 换个请求头就是新身份，
-    顺便把审计里的来源 IP 也一起污染了。
+    默认信任该请求头会允许调用方通过伪造来源绕过限流，并污染审计中的来源地址。
     """
     if config.TRUST_PROXY:
         xff = request.headers.get("x-forwarded-for")
@@ -41,11 +40,9 @@ def _client_key(request: Request) -> str:
 
 
 def _route_label(request: Request) -> str:
-    """指标标签：优先用路由模板，避免 /api/audit/<uuid> 把序列撑爆。
+    """指标标签优先使用路由模板，避免高基数路径生成大量时间序列。
 
-    中间件跑在路由匹配之前，`scope["route"]` 往往是空的，于是回落到原始路径 ——
-    这时一个随机 id 就是一条新时间序列，Prometheus 的基数会随请求量无界增长。
-    回落时按"像不像 id"做归一化。
+    中间件执行时路由可能尚未匹配，此时回落到原始路径，并对类似 ID 的片段做归一化。
     """
     route = request.scope.get("route")
     tpl = getattr(route, "path", None)
@@ -96,14 +93,13 @@ class RateLimit(BaseHTTPMiddleware):
         self._buckets: dict[str, tuple[float, float]] = defaultdict(lambda: (self.capacity, time.time()))
         self._ops = 0
 
-    MAX_BUCKETS = 20000          # 桶的硬上限，防止被扫 IP 打爆内存
-    IDLE_SECONDS = 600.0         # 超过这个时长没请求的桶直接回收
+    MAX_BUCKETS = 20000          # 限制桶数量，避免来源地址过多导致内存持续增长
+    IDLE_SECONDS = 600.0         # 回收超过该时长未访问的桶
 
     def _evict(self, now: float) -> None:
         """回收冷桶。
 
-        原来 `_buckets` 只增不减：来源越散字典越大，长期跑就是慢性内存泄漏
-        （而且 defaultdict 让"读"也会创建条目）。
+        _buckets 如果没有上限会随来源地址数量持续增长；defaultdict 的读取也会创建条目。
         """
         self._ops += 1
         if len(self._buckets) <= self.MAX_BUCKETS or self._ops % 256:

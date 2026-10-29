@@ -1,6 +1,6 @@
 """回复与卡片装配。
 
-这里只做"把结构化结果翻译成人话 + 卡片数据"，不做任何业务判断。
+本模块只负责将结构化结果转换为用户可读文本和卡片数据，不执行权限判断。
 所有数字都取自执行结果，模板里的字面数字会被 guard 记为白名单。
 """
 from __future__ import annotations
@@ -151,7 +151,7 @@ def build(intent: str, plan: Plan, out: Outcome, decision: Decision | None,
             c = Counter(RULE_LABEL.get(x["rule"], x["rule"]) for x in items)
             main_rule = c.most_common(1)[0][0]
             text, st1 = guard.render(
-                "扫了这一段的流水，发现 {n} 笔可疑交易，其中「{rule}」最值得先看。已按时间排好，逐条给了判定理由。",
+                "这段流水中发现 {n} 笔可疑交易，主要类型为「{rule}」。结果已按时间排序，并附有判定原因。",
                 {"n": len(items), "rule": main_rule})
         else:
             text, st1 = guard.render("这段流水没有发现明显异常。", {})
@@ -266,7 +266,7 @@ def build(intent: str, plan: Plan, out: Outcome, decision: Decision | None,
         elif cards:
             c0 = cards[0]
             text, st1 = guard.render(
-                "您名下有 {n} 张卡，尾号 {last4} 这张是主力卡，日交易限额 {lim} 元。",
+                "您名下有 {n} 张卡，尾号 {last4} 的日交易限额为 {lim} 元。",
                 {"n": len(cards), "last4": c0["last4"], "lim": c0["daily_limit"]})
         else:
             text, st1 = guard.render("您名下暂时没有可用的卡片。", {})
@@ -306,13 +306,13 @@ def build(intent: str, plan: Plan, out: Outcome, decision: Decision | None,
         gifts = (r["s2"].get("gifts") or [])
         hold = r.get("s1") or {}
         text, st1 = guard.render(
-            "已经为这件事锁定了 {amt} 元专项资金（订单 {hid}），挑了 {n} 个方案，选一个我来下单；不选的话这笔钱不会动。",
+            "已锁定 {amt} 元专项资金（订单 {hid}），并生成 {n} 个方案。选择后将按所选方案下单；未选择前不会下单。",
             {"amt": hold.get("amount", ""), "hid": hold.get("hold_id", ""), "n": len(gifts)})
         extra |= st1
         card = {"type": "choose", "title": "选一个礼物方案", "kind": "gift",
                 "options": [{"id": g["gift_id"], "label": g["name"],
                              "sub": f"{g['amount']} 元 · {g['vendor']}"} for g in gifts],
-                "note": f"专项资金 {hold.get('amount')} 元已锁定，未选定前不扣款"}
+                "note": f"专项资金 {hold.get('amount')} 元已锁定，确认方案后扣款"}
 
     elif intent == "gift.order" and "s1" in r:
         t = r["s1"]

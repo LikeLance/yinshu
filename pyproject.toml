@@ -1,7 +1,7 @@
 [project]
 name = "yinshu"
 version = "1.0.0"
-description = "银枢 YinShu · 可信银行智能体（安全策略下沉到执行层）"
+description = "银枢 YinShu：面向银行业务场景的智能体演示系统"
 requires-python = ">=3.11"
 
 [tool.pytest.ini_options]

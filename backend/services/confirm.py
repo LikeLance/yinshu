@@ -1,10 +1,10 @@
-"""确认态：把"用户看到的"和"将要执行的"锁在一起。
+"""确认态：关联用户看到的内容和最终执行的参数。
 
-这是最容易出事的一段：
-- 预览结果最多挂 5 分钟，期间世界会变（余额 / 黑名单 / 频率 / 设备）；
-- 用户可能连点两次确认，也可能两个 worker 同时收到确认。
+确认阶段需要处理两类并发风险：
+- 预览结果在有效期内可能失效，例如余额、黑名单、频率或设备状态变化；
+- 用户可能重复点击，多个 worker 也可能同时收到确认请求。
 
-所以确认时必须重新 preview + 重算指纹 + 重新决策，并用跨进程 CAS 抢占执行权。
+因此确认时重新 preview、重算指纹并重新决策，再通过跨进程 CAS 抢占执行权。
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def irreversible_steps(plan: Plan) -> list[str]:
 
 def confirm_card(plan: Plan, slots: dict, out: executor.Outcome, d: policy.Decision,
                   extra_rows: list[list[str]] | None = None,
-                  note: str = "点确认后才会真正执行；说「取消」随时终止") -> dict:
+                  note: str = "确认后才会执行；可随时取消") -> dict:
     rows = confirm_rows(plan, slots, out)
     if extra_rows:
         rows = extra_rows + rows
@@ -124,7 +124,7 @@ def execute_pending(s: fsm.Session, trace: str, t0: float, p: Any = None) -> dic
                      {"stale": True, "changes": drift["changes"],
                       "decision": d2.to_dict()}, t0)
 
-    # 3) 抢占：用户连点两次 / 两个 worker 同时收到确认，只有一个能真正执行
+    # 3) 抢占：用户可能重复点击，多个 worker 也可能同时收到确认，只有一个请求获得执行权
     if not fsm.claim(s, p, {**stash, "fp": fp2, "snapshot": snap2}):
         audit.append(trace, "confirm_duplicate", {}, "ok")
         return build_response(s, trace, "这笔已经在处理了，请勿重复确认。",

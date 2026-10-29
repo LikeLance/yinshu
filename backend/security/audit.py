@@ -1,19 +1,13 @@
-"""审计日志：哈希链 + 可校验 + 可追责 + 可锚定。
+"""审计日志：哈希链、校验、主体记录和锚定。
 
-每行 self_hash 覆盖前一行哈希与本案关键字段，任何一行被改，后续链条全部对不上。
+每条记录的 self_hash 覆盖前一条哈希和本条关键字段。修改历史记录会导致后续链校验失败。
 
-v2 相比 v1 改了五处，都是"原来会在生产上出事"的地方：
-
-1. **连接模型**：原实现是模块级单连接 + 进程内 threading.Lock。锁只在单进程内有效，
-   而 `start.py --prod` 是多 worker（多进程），两个进程会同时读到同一个 prev_hash
-   再各自插入 → 链分叉 → `verify()` 报断链。现改为 thread-local 连接 + `BEGIN IMMEDIATE`，
-   用数据库写锁做跨进程互斥。
-2. **busy_timeout**：WAL 下并发写没有 busy_timeout 会直接 `database is locked` 抛 500。
-3. **主体维度**：原实现 actor 恒为 "agent"，没有 user_id / device / ip / channel，
-   审计无法追到"谁在什么设备上做的"。v2 落这些字段并纳入哈希。
-4. **分块校验 + 检查点**：原 `verify()` 把整表 fetchall 进内存，行数一多就爆。
-5. **链尾锚定**：哈希链只能"改了能发现"，防不住"整表重写 + 本地重算"。锚定把 head
-   外发到 WORM/存证服务，才能发现这类攻击——这也是原文自评里的残余风险。
+v2 的主要变更：
+1. 使用 thread-local 数据库连接和 BEGIN IMMEDIATE，避免多进程追加时分叉；
+2. 设置 busy_timeout，减少 WAL 并发写入直接报锁冲突；
+3. 哈希覆盖主体、设备、来源地址和渠道，便于追责；
+4. 校验按批次读取，并定期写入检查点；
+5. 支持本地和 HTTP 锚点，用于发现整表重写后重新计算哈希的情况。
 """
 from __future__ import annotations
 
@@ -30,8 +24,8 @@ from backend.core.config import APP_DB
 from backend.security import pii
 
 GENESIS = "0" * 64
-SEP = "\x1f"                  # 不用 "|"：action/memo 里可能出现它，会把哈希字段拼歪
-CHECKPOINT_EVERY = 5000       # 每多少行落一个检查点
+SEP = "\x1f"                  # 避免使用可能出现在字段内容中的分隔符
+CHECKPOINT_EVERY = 5000       # 检查点间隔
 VERIFY_BATCH = 2000           # 分块校验的批大小
 LOCK_TIMEOUT_S = 5.0
 RETRY_BACKOFF = (0.01, 0.02, 0.04, 0.08, 0.16)

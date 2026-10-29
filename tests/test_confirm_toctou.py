@@ -85,7 +85,7 @@ def test_fingerprint_tracks_amount_change():
 
 
 def test_duplicate_confirm_returns_same_receipt_without_second_transfer(client):
-    """连点两次确认：第二次要么被幂等回放，要么被告知"处理中"，绝不重复扣款。"""
+    """连续提交两次确认时，第二次应被幂等回放或返回处理中，不产生第二笔转账。"""
     from backend.core import clock
 
     start = client.post("/api/chat", json={"text": "给我妈转8000"}).json()

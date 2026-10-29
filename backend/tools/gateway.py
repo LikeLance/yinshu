@@ -1,9 +1,9 @@
-"""工具网关：编排层访问外界（银行核心 / 三方）的唯一出口。
+"""业务工具网关，编排层调用银行核心和三方服务的统一入口。
 
-三件事：
-1. 参数校验（白名单 + 必填 + 类型 + 拒绝多余字段）；
-2. 幂等键与重试；
-3. 结果后处理（例如把"收款人候选"收窄为"确定的一个"）。
+主要职责：
+1. 参数校验：白名单、必填项、类型和多余字段；
+2. 幂等键、超时与重试；
+3. 结果归一化，例如将收款人候选收敛为确定结果。
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from backend.tools import registry
 TIMEOUT = 6.0
 MAX_RETRY = 2
 
-# 共享连接池：一次对话常常要连打 2~4 个下游接口，每次新建 TCP 在 Windows 上要 20~30ms
+# 共享连接池。一次对话通常调用 2~4 个下游接口，复用连接可以减少 TCP 建连开销。
 _CLIENT: httpx.Client | None = None
 
 
@@ -252,7 +252,7 @@ def _post(name: str, data: dict, local: dict | None = None) -> dict:
         top = cands[0]
         tied = [c for c in cands if abs(c["score"] - top["score"]) < 1e-6]
         # 只看"关系是否不同"是不够的：两个同名同关系的联系人（同班同学、两个同事）
-        # 会被静默取第一个，而产品对外的承诺是"绝不猜"。
+        # 否则会默认选择第一条候选，无法满足目标不明确时要求用户选择的行为。
         # 只要并列，就出候选卡让用户自己点。
         if len(tied) > 1:
             data["chosen"] = None

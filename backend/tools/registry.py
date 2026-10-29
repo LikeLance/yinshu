@@ -103,9 +103,8 @@ _reg(ToolSpec("transfer.collect", "POST", "/v1/transfers/collect",
               action="transfer.collect", money=False, idem=True, desc="AA 收款"))
 _reg(ToolSpec("hold.create", "POST", "/v1/holds",
               {"amount": str, "reason": str, "expire_at": str}, ("amount",), {},
-              # 锁资金不转钱，但它占用可用余额、是真实的状态变更。
-              # gated=False 时整条跨场景链路会被判成"纯只读"，在 preview 阶段直接执行 ——
-              # 用户还没确认礼物，专项资金已经被锁了，而且全程没走 policy.decide。
+              # 锁资金不产生转账，但会占用可用余额，属于状态变更。
+              # 必须标记 gated，否则跨场景链路会在预览阶段锁定资金，绕过确认。
               action="hold.create", gated=True, reversible=True, idem=True, desc="锁定专项资金"))
 _reg(ToolSpec("hold.release", "POST", "/v1/holds/{hold_id}/release",
               {"hold_id": int}, ("hold_id",), {},
@@ -115,17 +114,18 @@ MONEY_ACTIONS = {n for n, s in TOOLS.items() if s.money}
 
 
 class RegistryInvariantError(RuntimeError):
-    """注册表与策略配置对不上。这种错必须在启动期炸，不能等第一笔交易才发现。"""
+    """工具注册表与策略配置不一致。此类错误应在启动阶段暴露。"""
 
 
 def assert_invariants() -> None:
-    """启动期自检：注册表是资金链路的唯一入口，它的完整性不该靠"记得改"。
+    """启动期检查工具注册表和策略配置。
 
-    检查项都对应过真实错配：
-    - 资金写操作必须可去重（`idem=True`），否则一次重试就是一笔重复扣款；
-    - 受控动作必须有 `action`，否则 `Plan.primary_action()` 返回 None，策略只能按未知动作兜底；
-    - 每个 `action` 都要在 policy.json 里有基础分，否则 `score()` 会直接抛（他们改成 fail-fast 了）；
-    - `required` 必须是 `args` 子集，路径占位符必须取得到值（否则拼出 404 的 URL）。
+    检查项：
+    - 资金写操作必须支持幂等，否则重试可能重复扣款；
+    - 受控动作必须声明 action，供策略引擎计算基础风险；
+    - 每个 action 必须在 policy.json 中配置基础分；
+    - required 字段必须存在于 args；
+    - 路径占位符必须有对应参数。
     """
     from backend.security import policy
 

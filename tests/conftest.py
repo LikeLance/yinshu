@@ -69,11 +69,10 @@ def bank_url():
 
 @pytest.fixture(scope="session", autouse=True)
 def _frozen_clock():
-    """把权限引擎看到的时间钉在白天。
+    """将权限引擎使用的时钟固定在白天。
 
-    「凌晨 0-6 点」是 policy.json 的一个加分特征：真实时钟下同一句
-    「给我妈转500」在 00:05 会 +10 分越档变 CONFIRM，在 12:00 才是 AUTO。
-    不钉住时间，测试结果就取决于你几点跑——这不叫测试，叫抽奖。
+    policy.json 包含“凌晨 0-6 点”加分的规则。如果不固定时间，同一句
+    “给我妈转500”在凌晨会升为 CONFIRM，在白天则为 AUTO，测试结果会随运行时刻变化。
     """
     from datetime import datetime
 
@@ -98,11 +97,10 @@ def _patch_bank(bank_url):
 
 @pytest.fixture()
 def clean_bank():
-    """把银行数据重灌成种子状态。
+    """将银行数据恢复为种子状态。
 
-    多条用例要断言"只多了一笔转账"，而 `velocity_1h`（1 小时内资金操作次数）
-    是全套测试共享的银行状态：前面用例多转几笔，后面的风险分就会越档。
-    不重灌就是典型的顺序依赖。
+    多条用例需要断言只新增了一笔转账，而 velocity_1h 是整套测试共享的银行状态。
+    前序用例产生的资金操作会改变风险分，因此需要重置数据以避免顺序依赖。
     """
     from backend.mock_bank import seed as seed_mod
 

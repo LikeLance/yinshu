@@ -45,8 +45,8 @@ from backend.tools import gateway, registry
 
 log = get("app")
 
-# 启动期自检：注册表/策略配置错配（漏配权重、资金工具没开幂等、路径占位符对不上参数）
-# 一律在这里炸掉。宁可起不来，也别让它带着"闸门形同虚设"的配置对外服务。
+# 启动期检查工具注册表和策略配置，配置不一致时直接终止启动，
+# 避免服务带着缺失权重、未开启幂等或错误路径继续运行。
 registry.assert_invariants()
 
 
@@ -150,12 +150,10 @@ class ChatReq(BaseModel):
 
 def _settle(s: fsm.Session, intent: str, slots: dict, card: dict | None,
             out: executor.Outcome) -> None:
-    """执行完把会话落到正确的下一状态。
+    """根据执行结果将会话切换到下一状态。
 
-    出候选卡就进 CHOOSE 等用户选，否则归位。
-    原来只有"纯只读"分支处理了 choose 卡片 —— 一旦链路带受控步骤
-    （例如跨场景要先锁资金），候选卡发出去了、会话却停在 IDLE，
-    用户回一句"第2个"就被当成听不懂。卡片和状态机不能各走各的。
+    返回候选卡时进入 CHOOSE，否则重置会话。候选卡和 FSM 状态必须同时更新，
+    否则用户选择候选时会被当作无上下文输入。
     """
     if card and card.get("type") == "choose":
         # 生日流程是「先锁预算 → 选礼物 → 下单」：把 hold_id 带进下一阶段，
@@ -171,8 +169,8 @@ def _settle(s: fsm.Session, intent: str, slots: dict, card: dict | None,
 
 def _handle(s: fsm.Session, text: str, intent: str, slots: dict, trace: str,
             inj: bool, forced_payee: int | None = None) -> dict:
-    # 账户是按主体解析的：只有转账类需要（账单由核心系统按调用方身份取默认账户）。
-    # 写死 ACCOUNT_ID=1 会让第二个客户的钱从第一个客户的账户进出。
+    # 转账类请求需要按主体解析账户；账单类由核心系统按身份取默认账户。
+    # 固定使用 ACCOUNT_ID=1 会导致跨用户账户串用。
     account_id = account_of() if intent.startswith("transfer") else planner.ACCOUNT_ID
     plan = planner.build(intent, slots, account_id)
     if plan.missing:
@@ -329,10 +327,10 @@ def _client_ip(request: Request) -> str:
 
 
 def _executed(resp: JSONResponse) -> bool:
-    """这次请求是否真的改变了世界（拿到了回执卡）。
+    """判断本次请求是否已产生业务回执。
 
-    只读问答、以及"还需要再点一次确认"都**不算**——否则第二次「确认」
-    会被当成重放直接回放"请再确认一次"，用户永远落不了地。
+    只读问答和等待二次确认的响应不计入已完成，否则重复确认会被当作重放，
+    返回旧的确认提示而无法继续执行。
     """
     try:
         body = json.loads(bytes(resp.body))
@@ -343,11 +341,9 @@ def _executed(resp: JSONResponse) -> bool:
 
 def handle_chat(req: ChatReq, headers: dict[str, str] | None = None,
                 ip: str = "127.0.0.1") -> JSONResponse:
-    """对话主入口（不依赖 FastAPI Request）。
+    """对话主入口，不依赖 FastAPI Request。
 
-    抽出来的原因有两个：
-    1. 进程内调用者（评测脚本、其他渠道 adapter）不必伪造一个 Request；
-    2. "加渠道只写 adapter"这句话得有地方落——adapter 调这个函数即可。
+    供进程内调用者和渠道 adapter 使用，调用方无需构造 Request。
     """
     t0 = time.time()
     hdrs = {k.lower(): v for k, v in (headers or {}).items()}
@@ -439,8 +435,7 @@ def _chat_inner(req: ChatReq, p: identity.Principal, trace: str, t0: float):
             return JSONResponse(build_response(s, trace, "好的，已取消，这笔不会执行。",
                                       notice("info", "已取消", ["未发生任何资金变动"]),
                                       {"cancelled": True}, t0))
-        # 「好的，不过改成 600」：以确认词开头、但金额与待确认的不一致 →
-        # 按新金额重走一遍，**绝不能**当成"确认原金额"。
+        # 输入以确认词开头但金额发生变化时，按新金额重新执行，不复用原确认参数。
         amt_now = parse_amount(text)
         pend_amt = (s.stash.get("snapshot") or {}).get("amount")
         if amt_now is not None and pend_amt is not None and nlu.starts_with_confirm(text):
@@ -563,7 +558,7 @@ def run_plan(s: fsm.Session, plan: Plan, intent: str, slots: dict, trace: str, i
     if d.tier == "CONFIRM":
         stash_pending(s, plan, out, ctx, d, slots, intent, inj)
         return {"reply": f"这笔需要您确认（风险分 {d.risk}）。",
-                "card": confirm_card(plan, slots, out, d, note="点确认后才会真正执行"),
+                "card": confirm_card(plan, slots, out, d, note="确认后才会执行"),
                 "debug": {"decision": d.to_dict()}}
     try:
         executor.run(plan, "commit", trace, out)
@@ -694,7 +689,7 @@ async def _on_http(request: Request, exc: StarletteHTTPException):
 
 @app.exception_handler(Exception)
 async def _on_unhandled(request: Request, exc: Exception):
-    # 生产环境绝不把堆栈回给调用方，只留 request_id 供排查
+    # 生产环境不向调用方返回堆栈，只保留 request_id 供排查。
     log.exception("unhandled", request_id=getattr(request.state, "request_id", ""))
     return _err("INTERNAL_ERROR", "服务内部错误，请稍后重试或联系支持", 500, request)
 

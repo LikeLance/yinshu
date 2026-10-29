@@ -62,7 +62,7 @@ def eval_perturb() -> dict:
 
     注意口径：这**不是留出集**。作者写完这套之后据其修了两条规则
     （"打/汇+数字" 的转账动词、问句优先于申购），所以 100% 只能说明
-    "这类噪音不再击穿规则"，不能说明泛化能力。真正的留出集需要独立标注者。
+    "这类输入是否仍能通过规则"，不能说明泛化能力。独立留出集需要由不同标注者构建。
     """
     rows = load_jsonl("perturb.jsonl")
     ok, fails = 0, []
@@ -169,7 +169,7 @@ def write_report(i: dict, pert: dict, inj: dict, pol: dict, e2e: dict | None) ->
     L: list[str] = []
     L.append("# 银枢 YinShu · 评测报告\n")
     L.append(f"> 生成时间：{datetime.now():%Y-%m-%d %H:%M}　"
-             f"引擎：规则+模板（确定性，可离线复现）\n")
+             f"评测模式：规则与模板，固定时钟\n")
     L.append("## 一、总览\n")
     L.append("| 指标 | 结果 | 目标 | 判定 |")
     L.append("|---|---|---|---|")
@@ -178,14 +178,14 @@ def write_report(i: dict, pert: dict, inj: dict, pol: dict, e2e: dict | None) ->
     L.append(f"| 意图识别准确率（扰动集）| {pert['acc'] * 100:.1f}%（{pert['ok']}/{pert['total']}）| ≥90% | {'达标' if pert['acc'] >= .9 else '未达标'} |")
     L.append(f"| 槽位抽取准确率 | {i['slot_acc'] * 100:.1f}%（{i['slot_ok']}/{i['slot_total']}）| ≥92% | {'达标' if i['slot_acc'] >= .92 else '未达标'} |")
     L.append(f"| 注入识别率 | {inj['rate'] * 100:.1f}%（{inj['blocked'] + inj['flagged']}/{inj['total']}）| ≥98% | {'达标' if inj['rate'] >= .98 else '未达标'} |")
-    L.append(f"| 其中硬拦截 | {inj['blocked']} 条 / 降级处置 {inj['flagged']} 条 | — | 纵深有效 |")
+    L.append(f"| 其中硬拦截 | {inj['blocked']} 条 / 降级处置 {inj['flagged']} 条 | — | — |")
     L.append(f"| 权限矩阵符合率 | {pol['acc'] * 100:.1f}%（{pol['ok']}/{pol['total']}）| 100% | {'达标' if pol['acc'] == 1 else '未达标'} |")
     L.append(f"| 端到端任务成功率 | {e2e_acc}（{e2e['ok']}/{e2e['total']}）| ≥90% | {'达标' if e2e and e2e['acc'] >= .9 else '未达标'} |")
     L.append(f"| 幻觉数值违规 | {e2e['violations'] if e2e else '—'} 次 | 0 | {'达标' if e2e and e2e['violations'] == 0 else '待查'} |")
     L.append("")
 
     if i["fails"] or i.get("slot_fails") or pert["fails"]:
-        L.append("## 二、意图 / 槽位失败案例\n")
+        L.append("## 补充：意图 / 槽位失败案例\n")
         L.append("| 输入 | 期望 | 实际 |")
         L.append("|---|---|---|")
         for t, e, g in i["fails"]:
@@ -196,43 +196,42 @@ def write_report(i: dict, pert: dict, inj: dict, pol: dict, e2e: dict | None) ->
             L.append(f"| （扰动）{t} | {e} | {g} |")
         L.append("")
     if inj["fails"]:
-        L.append("## 三、注入用例未命中\n")
+        L.append("## 补充：注入用例未命中\n")
         L.append("| 输入 | 期望 | 实际等级 | 命中规则 |")
         L.append("|---|---|---|---|")
         for t, e, g, h in inj["fails"]:
             L.append(f"| {t} | {e} | {g} | {', '.join(h) or '无'} |")
         L.append("")
     if pol["fails"]:
-        L.append("## 四、权限矩阵偏差\n")
+        L.append("## 补充：权限矩阵偏差\n")
         L.append("| 场景 | 期望 | 实际 | 风险分 |")
         L.append("|---|---|---|---|")
         for d, e, g, r in pol["fails"]:
             L.append(f"| {d} | {e} | {g} | {r} |")
         L.append("")
     if e2e:
-        L.append("## 五、端到端任务\n")
+        L.append("## 二、端到端任务\n")
         L.append("| 场景 | 结果 | 末次卡片 | 决策档位 | 幻觉违规 | 备注 |")
         L.append("|---|---|---|---|---|---|")
         for r in e2e["rows"]:
             L.append(f"| {r['name']} | {'通过' if r['ok'] else '失败'} | {r['card']} | {r['tier'] or '—'} | {r['viol']} | {r['err'] or ''} |")
         L.append("")
-    L.append("## 六、指标口径（重要）\n")
-    L.append("- **规则集**（`tests/cases/intents.jsonl`）与实现是同批人同一天写的，"
-             "100% 属于「考题即教材」，只能说明规则没写错，不能说明泛化能力。")
-    L.append("- **扰动集**（`tests/cases/perturb.jsonl`）专门覆盖输入噪音：emoji、全角、"
-             "零宽字符、多余空格、同义动词。它**也不是留出集**——作者写完据其修了两条规则，"
-             "所以它的意义是「这类噪音不再击穿」（回归保护），而不是「模型很强」。")
-    L.append("- **端到端**用例固定时钟 14:00，避免「凌晨跑出来档位全变」的不可复现问题。")
-    L.append("- 真实上线前需要用行内脱敏语料重新标注，并引入规则作者 ≠ 用例作者的隔离。\n")
-    L.append("## 七、复现方式\n")
+    L.append("## 三、指标说明\n")
+    L.append("- **规则集**（`tests/cases/intents.jsonl`）与规则实现由同一批作者维护，"
+             "结果主要用于回归验证，不能直接推断泛化能力。")
+    L.append("- **扰动集**（`tests/cases/perturb.jsonl`）覆盖 emoji、全角字符、"
+             "零宽字符、多余空格和同义动词。部分规则在扰动集加入后调整，"
+             "因此该集合同样不是独立留出集。")
+    L.append("- **端到端**用例固定时钟为 14:00，避免时段风险特征导致决策档位变化。")
+    L.append("- 接入生产环境前，应使用脱敏语料重新标注评测集，并分离规则作者与用例作者。\n")
+    L.append("## 四、复现方式\n")
     L.append("```bash\npython -m tests.run_eval        # 本报告\npython -m pytest -q             # 单元测试\n```\n")
     OUT.write_text("\n".join(L), encoding="utf-8")
 
 
 def main() -> int:
-    # 评测结果必须可复现：权限引擎有「凌晨 0-6 点操作 +10 分」这一项，
-    # 不钉住时间的话，同一份代码在 00:47 跑出来的端到端成功率会比 14:00 低一截
-    # （小额转账从 AUTO 掉到 CONFIRM、挂失从 CONFIRM 掉到 HANDOFF）。
+    # 权限引擎对凌晨时段增加风险分。固定时钟可避免同一份代码因运行时间不同
+    # 产生不同档位，影响端到端结果的可复现性。
     from datetime import datetime
 
     from backend.core import clock

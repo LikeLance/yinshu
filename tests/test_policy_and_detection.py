@@ -67,10 +67,9 @@ def test_missing_weight_does_not_silently_default():
 # ---------------------------------------------------------------- 语言理解
 
 def test_confirm_does_not_swallow_amended_amount(client, clean_bank):
-    """「好的，不过改成600」不能当成"确认原金额 8000"。
+    """输入以确认词开头但修改了金额时，应按新金额处理。
 
-    改成小额后（常转收款人 + 600 元）本来就该直接执行，所以这里断言的不是
-    "要出确认卡"，而是"落地的金额是 600，绝不是 8000"。
+    常转收款人加 600 元可能直接执行，因此断言最终金额为 600，而不是原确认金额 8000。
     """
     start = client.post("/api/chat", json={"text": "给我妈转8000"}).json()
     assert start["card"]["type"] == "confirm"

@@ -1,9 +1,9 @@
-"""权限策略引擎 —— 本项目的核心差异化。
+"""权限策略引擎。
 
-三个设计原则：
-1. **代码级，不是提示词级**：模型说什么都不影响结果，只有这里的白纸黑字算数；
-2. **可解释**：每一分都对应一句人话，直接渲染进确认卡片；
-3. **默认往安全侧**：拿不准就升级到 CONFIRM，而不是放行。
+设计原则：
+1. 权限判断在服务端代码中完成，不依赖模型输出；
+2. 风险分和命中原因可解释，并随确认卡返回；
+3. 信息不足时向安全侧升级，而不是直接放行。
 """
 from __future__ import annotations
 
@@ -31,10 +31,8 @@ def config() -> dict:
     return _cfg_cache
 
 
-# 硬规则的谓词表。config/policy.json 里的 `when` 只能取这里的键，
-# 配错了启动即报错——原实现把这四条写死在 decide() 里，
-# 改 json 的 hard_rules 完全不生效，"银行改配置无需改代码"是句空话。
-# 阈值（如 5 万）也由 json 的 args 给，改阈值同样不用碰代码。
+# 硬规则谓词表。config/policy.json 的 `when` 只能引用这里的键，
+# 配置错误会在加载时失败。阈值由 json 的 args 提供，修改时不需要改代码。
 PREDICATES: dict[str, Callable[[Context, dict], bool]] = {
     "payee_blacklisted": lambda c, a: c.payee_blacklisted,
     "wealth_unsuitable": lambda c, a: c.wealth_unsuitable,

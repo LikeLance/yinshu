@@ -117,7 +117,7 @@ def test_confirm_card_marks_irreversible_actions():
 # ---------------- 账单：金额不碰浮点 ----------------
 
 def test_bill_summary_adds_up_in_decimal(bank_url):
-    """原实现 SUM(CAST(amount AS REAL))：先转二进制浮点再求和，与"绝不碰浮点"自相矛盾。"""
+    """账单旧实现使用浮点数累加，可能产生分位误差；此处校验 Decimal 汇总结果。"""
     with httpx.Client(base_url=bank_url, trust_env=False) as c:
         s = c.get("/v1/bills/summary", params={"from": "2000-01-01", "to": "2100-01-01"}).json()
     total = Decimal(s["total_out"])

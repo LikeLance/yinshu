@@ -1,12 +1,11 @@
-"""任务规划器：意图 + 槽位 → 可执行 DAG（模板版）。
+"""任务规划器：将意图和槽位转换为模板化 DAG。
 
-为什么是模板而不是让模型自由发挥：
-- 银行场景的动作集合是封闭的，模板覆盖率 100%，不存在"规划不出来"；
-- 模板产出的 DAG 结构稳定，测试可以断言"同一句话 10 次结构一致"；
-- 模型只用在"自然语言理解"和"话术组织"上，不用在"决定调哪个接口"上——
-  这本身就是一层安全设计（模型无法凭空发明一个不存在的动作）。
+采用模板而不是模型自由生成的原因：
+- 银行场景的动作集合有限，模板可以覆盖已支持的业务；
+- 计划结构稳定，便于测试和审计；
+- 模型不参与选择工具，避免生成不存在的动作。
 
-模型规划路径见 backend/planner/llm_planner.py（可选，用同一套 Plan 契约校验）。
+当前仓库不包含模型规划路径。
 """
 from __future__ import annotations
 
@@ -15,8 +14,7 @@ from decimal import Decimal
 from backend.core.config import DEMO_USER_ID
 from backend.planner.contracts import Plan, Step
 
-# 演示/兜底用；真实账户由 `build(..., account_id=...)` 从调用方身份解析后传入。
-# 注意：不要把这里当成"用户 1 的账户"——多租户下账户是 per-user 的。
+# 仅用于演示和缺省兜底。正常请求通过 build(..., account_id=...) 传入按身份解析的账户。
 ACCOUNT_ID = 1
 
 

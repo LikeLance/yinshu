@@ -1,7 +1,7 @@
 """结构化日志。
 
-演示时人看，上线时机读——所以两种格式都支持，由 YINSHU_LOG_JSON 控制。
-日志里一律不带完整卡号/账号，只留后四位（见 `mask()`）。
+支持文本和 JSON 两种格式，由 YINSHU_LOG_JSON 控制。敏感字段的脱敏由调用方
+和审计模块负责；新增日志字段时应避免写入完整卡号、手机号或凭据。
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ _RESERVED = {"name", "msg", "args", "levelname", "levelno", "pathname", "filenam
 
 
 def mask(value: Any, keep: int = 4) -> str:
-    """把账号/卡号/手机号打码成 ****1234，审计与日志都走它。"""
+    """将数字字符串保留后若干位，返回 ****1234 形式。"""
     s = str(value or "")
     digits = "".join(ch for ch in s if ch.isdigit())
     if len(digits) <= keep:

@@ -1,7 +1,7 @@
-"""注入检测（L1 输入层）。
+"""输入层注入检测。
 
-只做一件事：给输入打上 untrusted / suspicious 标签，供上层决定是否降级。
-不作为唯一防线——真正的兜底在权限闸门（L4）。
+对输入进行规则检测并标记 untrusted / suspicious，供后续策略提升风险档位。
+该层不是唯一防线，资金与不可逆操作仍由权限策略和工具网关约束。
 """
 from __future__ import annotations
 

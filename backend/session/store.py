@@ -1,14 +1,11 @@
-"""会话存储：默认落盘到 SQLite，重启不丢「待确认的那一笔」。
+"""会话存储：默认使用 SQLite，确保进程重启后可以恢复待确认事务。
 
-为什么要落盘：演示现场最怕的就是「用户刚点确认，服务重启了，钱没动、状态也没了」。
-会话里存的不是日志，而是**一笔已经过权限决策、等用户点确认的事务**，必须和审计一样持久。
+会话保存的是已经通过权限决策、等待用户确认的事务，需要与审计数据一样持久化。
+支持两种后端：
+  sqlite（默认）：单文件、WAL，可由多个 worker 共享
+  memory：用于单元测试
 
-两种后端：
-  sqlite（默认）—— 单文件、WAL、进程重启后能还原；多 worker 也能共享
-  memory        —— 单测用，快
-
-stash 里会混进三类对象（Plan / Outcome / Decision），所以序列化时打类型标记，
-反序列化按标记还原，不能用裸 json.dumps。
+stash 中包含 Plan、Outcome 和 Decision，序列化时写入类型标记，反序列化按标记还原。
 """
 from __future__ import annotations
 
@@ -26,7 +23,7 @@ from backend.core import config
 
 
 def _json_default(o: Any) -> Any:
-    """Decimal / 日期 / set 都要带类型标记——金额退回 float 就是精度事故。"""
+    """Decimal、日期和 set 需要类型标记，避免金额反序列化后退化为 float。"""
     from datetime import date, datetime
     from decimal import Decimal
 

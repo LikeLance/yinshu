@@ -116,7 +116,7 @@ def get(sid: str | None, principal: Any = None) -> Session:
 
 
 def claim(s: Session, principal: Any, new_stash: dict) -> bool:
-    """确认态抢占（跨进程 CAS）：只有抢到的一方才能真正执行这笔。
+    """确认态抢占（跨进程 CAS）：只有获得执行权的一方可以执行该事务。
 
     用户连点两次确认 / 两个 worker 同时收到确认时，第二次返回 False。
     """
@@ -169,7 +169,7 @@ def await_confirm(s: Session, payload: dict) -> None:
 
 
 def touch(s: Session) -> None:
-    """刷新活跃时间（限频），让 TTL 只淘汰真正闲置的会话。"""
+    """刷新活跃时间（限频），使 TTL 只淘汰闲置会话。"""
     if time.time() - s.updated >= TOUCH_INTERVAL:
         _persist(s)
 

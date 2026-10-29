@@ -21,10 +21,10 @@ def _raw(sql: str, params: tuple = ()) -> list[sqlite3.Row]:
 
 
 def test_concurrent_appends_keep_chain_linear():
-    """20 线程 × 25 次并发写，链必须仍然是一条直线。
+    """20 线程 × 25 次并发写，链应保持单一线性结构。
 
-    老实现里 20 个线程共用一把进程内锁还能撑住，真正的杀手是多进程；
-    这里同时验证了 per-thread 连接 + BEGIN IMMEDIATE 没有引入新的断链。
+    旧实现只在进程内加锁，多进程写入时仍可能产生分叉。
+    该用例同时验证 thread-local 连接和 BEGIN IMMEDIATE 没有引入新的断链。
     """
     threads, per = 20, 25
     errors: list[BaseException] = []

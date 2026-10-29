@@ -6,7 +6,7 @@
 
 生产路径仍然读真实时间；测试用 `freeze()` 把时间钉住；
 演示可以用 `YINSHU_FIXED_HOUR=14` 只把「小时」钉住（prod 下忽略），
-这样 README 里那 13 场剧本的结果不会因为凌晨答辩而变档。
+固定小时用于演示环境，避免同一请求因运行时段不同产生不同风险档位。
 """
 from __future__ import annotations
 

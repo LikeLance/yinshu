@@ -108,7 +108,7 @@ def _default_account(owner: int | None = None) -> int:
 
 
 def _account_or_default(account_id: int | None) -> int:
-    """显式传了账户就校验归属，没传就用默认账户——绝不跨用户兜底。"""
+    """显式传入账户时校验归属，未传入时使用默认账户，不回退到其他用户。"""
     if account_id is None:
         return _default_account()
     _own("accounts", account_id, uid(), "账户")
@@ -221,7 +221,7 @@ def create_transfer(payload: dict = Body(...), idempotency_key: str | None = Hea
 
     hit = _conn.execute("SELECT * FROM transfers WHERE idem_key=?", (idempotency_key,)).fetchone()
     if hit:                                     # 幂等：返回首次结果
-        # 注意：重放必须与首次同构，否则客户端按一套 schema 解析会在重试时炸
+        # 注意：重放响应必须与首次响应结构一致，否则客户端重试时可能解析失败
         payee0 = _conn.execute("SELECT * FROM payees WHERE id=?", (hit["payee_id"],)).fetchone()
         return {
             "transfer_id": hit["id"],
@@ -367,9 +367,8 @@ _AGG_COLUMNS = {"category": "category", "merchant": "merchant"}
 def _agg_out(col: str, account_id: int, d0: str, d1: str) -> dict[str, tuple[int, Decimal]]:
     """按列聚合流出金额（笔数, 金额合计）。
 
-    金额在库里是 TEXT，这里取出来用 Decimal 累加。
-    原实现是 `SUM(CAST(amount AS REAL))` —— 先转二进制浮点再求和，分位误差随笔数累积，
-    和本项目"金额一律走字符串 / Decimal、绝不碰浮点"的承诺自相矛盾。
+    金额以 TEXT 存储，此处使用 Decimal 累加。若改为 SQL 的 SUM(CAST(... AS REAL))，
+    浮点分位误差会随交易数量累积。
     """
     sql = ("SELECT " + _AGG_COLUMNS[col] + " AS k, amount FROM transactions"
            " WHERE account_id=? AND direction='out' AND substr(ts,1,10) BETWEEN ? AND ?")
@@ -560,10 +559,9 @@ def holdings():
 
 
 def _idem(scope: str, key: str | None, handler) -> dict:
-    """通用幂等封装：同一 Idempotency-Key 只真正执行一次，重试返回首次结果。
+    """统一幂等处理：相同 Idempotency-Key 只执行一次，重试返回首次结果。
 
-    转账与锁资金各自实现了幂等，但理财申购/赎回、礼物下单没有 ——
-    网关侧明明标了 idem 并带上了头，核心系统直接无视，重试即重复下单。
+    理财申购、赎回和礼物下单都需要消费网关传入的幂等请求头，避免超时重试产生重复订单。
     """
     if not key:
         raise HTTPException(400, {"code": "IDEMPOTENCY_REQUIRED",
@@ -748,10 +746,9 @@ def risk_stats():
 
 @app.post("/v1/holds")
 def create_hold(payload: dict = Body(...), idempotency_key: str | None = Header(default=None)):
-    """锁定资金。与转账一样必须带幂等键——锁资金也是"改世界"的操作。
+    """锁定资金。该操作改变账户状态，因此必须携带幂等键。
 
-    原实现不收幂等头，而网关侧 hold.create 又没标 idem，两边都漏：
-    网络超时重试一次就多锁一笔，用户看到可用余额莫名少了两倍预算。
+    如果缺少幂等处理，网络超时后的重试会重复锁定资金，导致可用余额异常减少。
     """
     if not idempotency_key:
         raise HTTPException(400, {"code": "IDEMPOTENCY_REQUIRED",
